@@ -1,0 +1,665 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+// DST Hidden Markov Model v2 — XAUUSD M5  [MOBILE EDITION]
+// ═══════════════════════════════════════════════════════════════════════════
+// Training   : Baum-Welch EM  (multivariate, diagonal covariance)
+// Decoding   : Log-Viterbi  (numerically stabil di log-space)
+// Observation: D=3 features — Return Z, ATR Z, EMA Slope Z
+//
+// MOBILE EDITION — perubahan dari v2 original:
+//   [+] Semua tabel digabung menjadi SATU tabel vertikal (2 kolom)
+//   [+] Tabel diposisikan di tengah layar agar mudah dilihat di HP
+//   [+] Text size default "large" agar terbaca tanpa zoom
+//   [+] Setiap section dipisah header berwarna agar mudah dipindai
+//   [+] Info paling penting (regime + SL/TP) ditaruh di bagian ATAS
+//   [+] Toggle per section tetap tersedia
+// ═══════════════════════════════════════════════════════════════════════════
+
+indicator("DST HMM v2 - Mobile", overlay = true, max_labels_count = 500)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────
+grp_h = "HMM Training"
+grp_f = "Feature Settings"
+grp_a = "ATR & SL/TP"
+grp_d = "Display"
+grp_p = "Table Position"
+
+hmm_win     = input.int(60,    "Training Window (bars)",         minval=20, maxval=150, group=grp_h)
+bw_n        = input.int(5,     "Baum-Welch Iterations",          minval=1,  maxval=15,  group=grp_h)
+sig_floor   = input.float(0.05,"Min Emission sigma",             minval=0.01, maxval=1.0, step=0.01, group=grp_h)
+stat_pow    = input.int(30,    "Stationary Power (A^n)",         minval=10, maxval=100, group=grp_h)
+min_dur_s   = input.int(3,     "Min Duration Sideways (bars)",   minval=1,  maxval=20,  group=grp_h)
+min_dur_b   = input.int(2,     "Min Duration Bull/Bear (bars)",  minval=1,  maxval=20,  group=grp_h)
+
+z_win       = input.int(20,    "Z-Score Window",                 minval=5,  maxval=100, group=grp_f)
+ema_len     = input.int(21,    "EMA Length (slope)",             minval=5,  maxval=100, group=grp_f)
+slope_per   = input.int(5,     "Slope Lookback (bars)",          minval=1,  maxval=20,  group=grp_f)
+atr_len_f   = input.int(14,    "ATR Length (fitur)",             minval=1,  maxval=50,  group=grp_f)
+
+atr_len_sl  = input.int(14,    "ATR Length (SL/TP)",             minval=1,  maxval=50,  group=grp_a)
+atr_bull    = input.float(1.2, "ATR Mult - Bull",                minval=0.5, maxval=5.0, step=0.1, group=grp_a)
+atr_bear    = input.float(1.5, "ATR Mult - Bear",                minval=0.5, maxval=5.0, step=0.1, group=grp_a)
+rr_r        = input.float(2.0, "Risk Reward Ratio",              minval=1.0, maxval=10.0, step=0.5, group=grp_a)
+
+show_rib    = input.bool(true,  "Regime Ribbon",                 group=grp_d)
+show_warn   = input.bool(true,  "Sideways Warning",              group=grp_d)
+show_lbl    = input.bool(true,  "Label Transitions",             group=grp_d)
+min_hold    = input.int(4,      "Min Hold Bars (debounce)",      minval=1, maxval=50, group=grp_d)
+
+// Section toggles
+sec_signal  = input.bool(true,  "Tampilkan: SIGNAL (Regime + SL/TP)", group=grp_d)
+sec_matrix  = input.bool(true,  "Tampilkan: TRANSITION MATRIX",       group=grp_d)
+sec_emit    = input.bool(true,  "Tampilkan: EMISSION PARAMS",         group=grp_d)
+sec_stat    = input.bool(true,  "Tampilkan: LONG-RUN DISTRIBUTION",   group=grp_d)
+
+tbl_pos     = input.string("middle_center", "Posisi Tabel",
+              options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"],
+              group=grp_p,
+              tooltip="Untuk HP: middle_center atau bottom_center paling nyaman")
+tsize       = input.string("large", "Ukuran Teks",
+              options=["small","normal","large","huge"], group=grp_d,
+              tooltip="Untuk HP gunakan large atau huge")
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+gpos(s) =>
+    switch s
+        "top_left"      => position.top_left
+        "top_center"    => position.top_center
+        "top_right"     => position.top_right
+        "middle_left"   => position.middle_left
+        "middle_center" => position.middle_center
+        "middle_right"  => position.middle_right
+        "bottom_left"   => position.bottom_left
+        "bottom_center" => position.bottom_center
+        => position.bottom_right
+
+gsz(s) =>
+    switch s
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        => size.huge
+
+gszh(s) =>
+    switch s
+        "huge"  => size.large
+        "large" => size.normal
+        => size.small
+
+mm3(A3, B3) =>
+    C3 = array.new_float(9, 0.0)
+    for r3 = 0 to 2
+        for c3 = 0 to 2
+            s3 = 0.0
+            for k3 = 0 to 2
+                s3 += array.get(A3, r3*3+k3) * array.get(B3, k3*3+c3)
+            array.set(C3, r3*3+c3, s3)
+    C3
+
+fmtp(p) => str.tostring(math.round(p * 100)) + "%"
+fmtf(v) => str.tostring(math.round(v * 100) / 100.0, "#.##")
+fmtd(v) => str.tostring(math.round(v * 10) / 10.0, "#.#") + "b"
+
+sv = gsz(tsize)
+sh = gszh(tsize)
+
+// ─── PALETTE ─────────────────────────────────────────────────────────────────
+CB  = color.rgb(132, 187, 161)
+CR  = color.rgb(197, 127, 134)
+CS  = color.rgb(164, 171, 183)
+CK  = color.new(#0B0F0D, 8)
+CF  = color.new(#3FDE7E, 78)
+CA  = #3FDE7E
+CDG = color.new(#3FDE7E, 80)
+CDT = #6BF0A6
+COF = color.new(color.white, 55)
+CHD = color.new(color.white, 35)
+CFT = color.new(color.white, 60)
+CWN = color.rgb(255, 200, 0, 88)
+CWT = color.white
+CYW = color.rgb(255, 200, 0)
+
+// Section header bg — sedikit lebih terang dari CK
+CSH = color.new(#1A2E20, 10)
+
+rgc(r)  => r == 1 ? CB  : r == 2 ? CR  : CS
+rgn(r)  => r == 1 ? "BULL" : r == 2 ? "BEAR" : "SIDEWAYS"
+rgd(r)  =>
+    if r == 1
+        "SL = ATR x" + str.tostring(atr_bull,"#.#") + "  |  IKUTI NAIK"
+    else if r == 2
+        "SL = ATR x" + str.tostring(atr_bear,"#.#") + "  |  IKUTI TURUN"
+    else
+        "SIDEWAYS - DON'T TRADE"
+rgs(r)  => r == 1 ? "BIAS BUY" : r == 2 ? "BIAS SELL" : "DON'T TRADE"
+rgsc(r) => r == 1 ? CB : r == 2 ? CR : CYW
+
+// ─── FEATURE COMPUTATION ─────────────────────────────────────────────────────
+lr      = close > 0 and close[1] > 0 ? math.log(close / close[1]) : 0.0
+lr_mu   = ta.sma(lr, z_win)
+lr_sd   = ta.stdev(lr, z_win)
+z_ret   = lr_sd > 1e-10 ? (lr - lr_mu) / lr_sd : 0.0
+
+atr_raw  = ta.atr(atr_len_f)
+atr_mu   = ta.sma(atr_raw, z_win)
+atr_sd   = ta.stdev(atr_raw, z_win)
+z_atr    = atr_sd > 1e-10 ? (atr_raw - atr_mu) / atr_sd : 0.0
+
+ema_val   = ta.ema(close, ema_len)
+slope_raw = atr_raw > 1e-10 ? (ema_val - ema_val[slope_per]) / (slope_per * atr_raw) : 0.0
+slope_mu  = ta.sma(slope_raw, z_win)
+slope_sd  = ta.stdev(slope_raw, z_win)
+z_slope   = slope_sd > 1e-10 ? (slope_raw - slope_mu) / slope_sd : 0.0
+
+// ─── OBSERVATION STORAGE ─────────────────────────────────────────────────────
+var array<float> OB1 = array.new_float(0)
+var array<float> OB2 = array.new_float(0)
+var array<float> OB3 = array.new_float(0)
+
+array.push(OB1, z_ret)
+array.push(OB2, z_atr)
+array.push(OB3, z_slope)
+if array.size(OB1) > hmm_win
+    array.shift(OB1)
+    array.shift(OB2)
+    array.shift(OB3)
+
+// ─── HMM PARAMETERS ──────────────────────────────────────────────────────────
+var array<float> HP  = array.from(0.40, 0.30, 0.30)
+var array<float> HA  = array.from(0.70, 0.15, 0.15, 0.20, 0.65, 0.15, 0.20, 0.15, 0.65)
+var array<float> HMU = array.from(0.0, -0.5, 0.0, 1.2, 0.5, 1.0, -1.2, 0.5, -1.0)
+var array<float> HSG = array.from(0.5, 0.7, 0.5, 0.9, 1.0, 0.9, 0.9, 1.0, 0.9)
+
+var int   VR   = 0
+var float VC   = 0.40
+var array<float> VP = array.from(0.40, 0.30, 0.30)
+var int   VDUR = 0
+
+var float LG2PI3 = 1.5 * math.log(2.0 * math.pi)
+
+log_mvg(o1, o2, o3, s) =>
+    s0 = math.max(array.get(HSG, s*3+0), 1e-10)
+    s1 = math.max(array.get(HSG, s*3+1), 1e-10)
+    s2 = math.max(array.get(HSG, s*3+2), 1e-10)
+    d0 = (o1 - array.get(HMU, s*3+0)) / s0
+    d1 = (o2 - array.get(HMU, s*3+1)) / s1
+    d2 = (o3 - array.get(HMU, s*3+2)) / s2
+    -math.log(s0) - math.log(s1) - math.log(s2) - 0.5*(d0*d0 + d1*d1 + d2*d2) - LG2PI3
+
+mvg_pdf(o1, o2, o3, s) =>
+    lv = log_mvg(o1, o2, o3, s)
+    lv > -500.0 ? math.exp(lv) : 1e-200
+
+// ─── MAIN HMM ────────────────────────────────────────────────────────────────
+if barstate.islast
+    T = math.min(array.size(OB1), hmm_win)
+    N = 3
+    if T >= 10
+
+        // Baum-Welch EM
+        for _it = 0 to bw_n - 1
+            al = array.new_float(T * N, 0.0)
+            sc = array.new_float(T, 1e-300)
+            s0v = 0.0
+            for s = 0 to N-1
+                v = array.get(HP, s) * mvg_pdf(array.get(OB1,0), array.get(OB2,0), array.get(OB3,0), s)
+                array.set(al, s, v)
+                s0v += v
+            s0v := math.max(s0v, 1e-300)
+            array.set(sc, 0, s0v)
+            for s = 0 to N-1
+                array.set(al, s, array.get(al, s) / s0v)
+            for t = 1 to T-1
+                stv = 0.0
+                for s = 0 to N-1
+                    sm = 0.0
+                    for p = 0 to N-1
+                        sm += array.get(al, (t-1)*N+p) * array.get(HA, p*N+s)
+                    v = sm * mvg_pdf(array.get(OB1,t), array.get(OB2,t), array.get(OB3,t), s)
+                    array.set(al, t*N+s, v)
+                    stv += v
+                stv := math.max(stv, 1e-300)
+                array.set(sc, t, stv)
+                for s = 0 to N-1
+                    array.set(al, t*N+s, array.get(al, t*N+s) / stv)
+            be = array.new_float(T * N, 0.0)
+            for s = 0 to N-1
+                array.set(be, (T-1)*N+s, 1.0 / array.get(sc, T-1))
+            for rv = 0 to T-2
+                t   = T-2 - rv
+                sct = array.get(sc, t)
+                for s = 0 to N-1
+                    sm = 0.0
+                    for sn = 0 to N-1
+                        bsn = mvg_pdf(array.get(OB1,t+1), array.get(OB2,t+1), array.get(OB3,t+1), sn)
+                        sm += array.get(HA, s*N+sn) * bsn * array.get(be, (t+1)*N+sn)
+                    array.set(be, t*N+s, sm / sct)
+            gm = array.new_float(T * N, 0.0)
+            for t = 0 to T-1
+                gs = 0.0
+                for s = 0 to N-1
+                    g = array.get(al, t*N+s) * array.get(be, t*N+s)
+                    array.set(gm, t*N+s, g)
+                    gs += g
+                gs := math.max(gs, 1e-300)
+                for s = 0 to N-1
+                    array.set(gm, t*N+s, array.get(gm, t*N+s) / gs)
+            xi = array.new_float((T-1)*N*N, 0.0)
+            for t = 0 to T-2
+                xs = 0.0
+                for i = 0 to N-1
+                    for j = 0 to N-1
+                        bj = mvg_pdf(array.get(OB1,t+1), array.get(OB2,t+1), array.get(OB3,t+1), j)
+                        xv = array.get(al,t*N+i) * array.get(HA,i*N+j) * bj * array.get(be,(t+1)*N+j)
+                        array.set(xi, t*N*N+i*N+j, xv)
+                        xs += xv
+                xs := math.max(xs, 1e-300)
+                for i = 0 to N-1
+                    for j = 0 to N-1
+                        array.set(xi, t*N*N+i*N+j, array.get(xi, t*N*N+i*N+j) / xs)
+            psum = 0.0
+            for s = 0 to N-1
+                psum += array.get(gm, s)
+            psum := math.max(psum, 1e-300)
+            for s = 0 to N-1
+                array.set(HP, s, array.get(gm, s) / psum)
+            for i = 0 to N-1
+                di = 0.0
+                for t = 0 to T-2
+                    di += array.get(gm, t*N+i)
+                for j = 0 to N-1
+                    nij = 0.0
+                    for t = 0 to T-2
+                        nij += array.get(xi, t*N*N+i*N+j)
+                    array.set(HA, i*N+j, math.max(di > 1e-300 ? nij/di : 1.0/N, 1e-8))
+                rs = 0.0
+                for j = 0 to N-1
+                    rs += array.get(HA, i*N+j)
+                if rs > 0
+                    for j = 0 to N-1
+                        array.set(HA, i*N+j, array.get(HA, i*N+j) / rs)
+            for s = 0 to N-1
+                gs2 = 0.0
+                for t = 0 to T-1
+                    gs2 += array.get(gm, t*N+s)
+                for d = 0 to 2
+                    wm = 0.0
+                    for t = 0 to T-1
+                        g     = array.get(gm, t*N+s)
+                        obs_d = d == 0 ? array.get(OB1,t) : d == 1 ? array.get(OB2,t) : array.get(OB3,t)
+                        wm += g * obs_d
+                    mu_nd = gs2 > 1e-300 ? wm / gs2 : array.get(HMU, s*3+d)
+                    array.set(HMU, s*3+d, mu_nd)
+                    wv = 0.0
+                    for t = 0 to T-1
+                        g     = array.get(gm, t*N+s)
+                        obs_d = d == 0 ? array.get(OB1,t) : d == 1 ? array.get(OB2,t) : array.get(OB3,t)
+                        diff  = obs_d - mu_nd
+                        wv   += g * diff * diff
+                    sig_nd = gs2 > 1e-300 ? math.sqrt(wv / gs2) : array.get(HSG, s*3+d)
+                    array.set(HSG, s*3+d, math.max(sig_nd, float(sig_floor)))
+
+        // State label ordering
+        m0v = array.get(HMU, 0*3+0)
+        m1v = array.get(HMU, 1*3+0)
+        m2v = array.get(HMU, 2*3+0)
+        bull_id = m0v >= m1v and m0v >= m2v ? 0 : m1v >= m2v ? 1 : 2
+        bear_id = m0v <= m1v and m0v <= m2v ? 0 : m1v <= m2v ? 1 : 2
+        side_id = bull_id == bear_id ? 2 : 3 - bull_id - bear_id
+        if not (bull_id == 1 and bear_id == 2 and side_id == 0)
+            mpv = array.new_int(3, 0)
+            array.set(mpv, 0, side_id)
+            array.set(mpv, 1, bull_id)
+            array.set(mpv, 2, bear_id)
+            tmu = array.new_float(9, 0.0)
+            tsg = array.new_float(9, 0.0)
+            tpi = array.new_float(3, 0.0)
+            tA  = array.new_float(9, 0.0)
+            for ni = 0 to 2
+                oi = array.get(mpv, ni)
+                array.set(tpi, ni, array.get(HP, oi))
+                for d = 0 to 2
+                    array.set(tmu, ni*3+d, array.get(HMU, oi*3+d))
+                    array.set(tsg, ni*3+d, array.get(HSG, oi*3+d))
+            for ni = 0 to 2
+                oi = array.get(mpv, ni)
+                for nj = 0 to 2
+                    oj = array.get(mpv, nj)
+                    array.set(tA, ni*3+nj, array.get(HA, oi*3+oj))
+            for s = 0 to 2
+                array.set(HP, s, array.get(tpi, s))
+                for d = 0 to 2
+                    array.set(HMU, s*3+d, array.get(tmu, s*3+d))
+                    array.set(HSG, s*3+d, array.get(tsg, s*3+d))
+            for idx = 0 to 8
+                array.set(HA, idx, array.get(tA, idx))
+
+        // Log-Viterbi
+        NEG_INF = -1e30
+        log_dl  = array.new_float(T * N, NEG_INF)
+        psi_v   = array.new_int(T * N, 0)
+        for s = 0 to N-1
+            lp_s = array.get(HP, s) > 1e-300 ? math.log(array.get(HP, s)) : -500.0
+            lb_s = log_mvg(array.get(OB1,0), array.get(OB2,0), array.get(OB3,0), s)
+            array.set(log_dl, s, lp_s + lb_s)
+        for t = 1 to T-1
+            for s = 0 to N-1
+                max_lv = NEG_INF
+                max_pv = 0
+                for p = 0 to N-1
+                    la = array.get(HA, p*N+s) > 1e-300 ? math.log(array.get(HA, p*N+s)) : -500.0
+                    lv = array.get(log_dl, (t-1)*N+p) + la
+                    if lv > max_lv
+                        max_lv := lv
+                        max_pv := p
+                lb_s = log_mvg(array.get(OB1,t), array.get(OB2,t), array.get(OB3,t), s)
+                array.set(log_dl, t*N+s, max_lv + lb_s)
+                array.set(psi_v,  t*N+s, max_pv)
+        vpath = array.new_int(T, 0)
+        lmx   = NEG_INF
+        ls    = 0
+        for s = 0 to N-1
+            if array.get(log_dl, (T-1)*N+s) > lmx
+                lmx := array.get(log_dl, (T-1)*N+s)
+                ls  := s
+        array.set(vpath, T-1, ls)
+        for rv2 = 0 to T-2
+            t = T-2 - rv2
+            array.set(vpath, t, array.get(psi_v, (t+1)*N + array.get(vpath, t+1)))
+
+        // Duration smoothing
+        cur_state = array.get(vpath, 0)
+        cur_dur   = 1
+        for t = 1 to T-1
+            nxt = array.get(vpath, t)
+            if nxt != cur_state
+                min_d = cur_state == 0 ? min_dur_s : min_dur_b
+                if cur_dur < min_d
+                    array.set(vpath, t, cur_state)
+                else
+                    cur_state := nxt
+                    cur_dur   := 1
+            else
+                cur_dur += 1
+        VR := array.get(vpath, T-1)
+        dur_count = 0
+        for dv = T-1 to 0
+            if array.get(vpath, dv) == VR
+                dur_count += 1
+            else
+                break
+        VDUR := dur_count
+
+        // Posterior gamma
+        a2  = array.new_float(T * N, 0.0)
+        s2c = array.new_float(T, 1e-300)
+        s0b = 0.0
+        for s = 0 to N-1
+            v = array.get(HP,s) * mvg_pdf(array.get(OB1,0), array.get(OB2,0), array.get(OB3,0), s)
+            array.set(a2, s, v)
+            s0b += v
+        s0b := math.max(s0b, 1e-300)
+        array.set(s2c, 0, s0b)
+        for s = 0 to N-1
+            array.set(a2, s, array.get(a2,s) / s0b)
+        for t = 1 to T-1
+            stb = 0.0
+            for s = 0 to N-1
+                sm = 0.0
+                for p3 = 0 to N-1
+                    sm += array.get(a2,(t-1)*N+p3) * array.get(HA,p3*N+s)
+                v = sm * mvg_pdf(array.get(OB1,t), array.get(OB2,t), array.get(OB3,t), s)
+                array.set(a2, t*N+s, v)
+                stb += v
+            stb := math.max(stb, 1e-300)
+            array.set(s2c, t, stb)
+            for s = 0 to N-1
+                array.set(a2, t*N+s, array.get(a2,t*N+s) / stb)
+        b2 = array.new_float(T * N, 0.0)
+        for s = 0 to N-1
+            array.set(b2,(T-1)*N+s, 1.0 / array.get(s2c, T-1))
+        for rv3 = 0 to T-2
+            t   = T-2 - rv3
+            sct = array.get(s2c, t)
+            for s = 0 to N-1
+                sm = 0.0
+                for sn = 0 to N-1
+                    bsn = mvg_pdf(array.get(OB1,t+1), array.get(OB2,t+1), array.get(OB3,t+1), sn)
+                    sm += array.get(HA,s*N+sn) * bsn * array.get(b2,(t+1)*N+sn)
+                array.set(b2, t*N+s, sm / sct)
+        gf = 0.0
+        for s = 0 to N-1
+            g = array.get(a2,(T-1)*N+s) * array.get(b2,(T-1)*N+s)
+            array.set(VP, s, g)
+            gf += g
+        gf := math.max(gf, 1e-300)
+        for s = 0 to N-1
+            array.set(VP, s, array.get(VP,s) / gf)
+        VC := array.get(VP, VR)
+
+// ─── INSTANTANEOUS REGIME ────────────────────────────────────────────────────
+lp0 = log_mvg(z_ret, z_atr, z_slope, 0) + math.log(math.max(array.get(HP,0), 1e-10))
+lp1 = log_mvg(z_ret, z_atr, z_slope, 1) + math.log(math.max(array.get(HP,1), 1e-10))
+lp2 = log_mvg(z_ret, z_atr, z_slope, 2) + math.log(math.max(array.get(HP,2), 1e-10))
+IR  = lp1 >= lp0 and lp1 >= lp2 ? 1 : lp2 >= lp0 and lp2 >= lp1 ? 2 : 0
+
+// ─── RIBBON & WARNING ────────────────────────────────────────────────────────
+rib_col = IR == 1 ? color.new(CB,30) : IR == 2 ? color.new(CR,30) : color.new(CS,30)
+bgcolor(show_rib  ? rib_col : na, title="Regime Ribbon")
+bgcolor(show_warn and IR == 0 ? CWN : na, title="Sideways Warning")
+
+// ─── TRANSITION LABELS ───────────────────────────────────────────────────────
+var int LR = na
+held = not na(IR)
+for k = 0 to min_hold - 1
+    held := held and not na(IR[k]) and IR[k] == IR
+if barstate.isconfirmed and not na(IR) and held and IR != LR
+    if show_lbl and not na(LR)
+        fo = min_hold - 1
+        label.new(bar_index - fo, high[fo], rgn(LR) + " > " + rgn(IR), yloc=yloc.abovebar, style=label.style_label_down, color=rgc(IR), textcolor=CWT, size=size.normal)
+    LR := IR
+
+// ─── ATR & SL/TP ─────────────────────────────────────────────────────────────
+atr_sl  = ta.atr(atr_len_sl)
+sl_mult = VR == 1 ? atr_bull : VR == 2 ? atr_bear : float(na)
+sl_val  = na(sl_mult) ? float(na) : atr_sl * sl_mult
+tp_val  = na(sl_val)  ? float(na) : sl_val * rr_r
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MOBILE TABLE — satu tabel vertikal 2 kolom
+// Row count: dihitung dinamis sesuai section yang aktif
+// Layout per section:
+//   [HEADER SECTION]  ← 1 baris, full width (merge visual via bgcolor)
+//   [label] [value]   ← baris data
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Hitung total rows yang dibutuhkan
+// SIGNAL: 1 header + 7 baris data = 8
+// MATRIX: 1 header + 1 subheader + 3 baris + 1 footer = 6
+// EMIT:   1 header + 1 subheader + 3 baris + 1 footer = 6
+// STAT:   1 header + 2 baris = 3
+// TOTAL MAX = 8 + 6 + 6 + 3 = 23
+
+var table TM = table.new(gpos(tbl_pos), 2, 23, bgcolor=CK, border_width=1, border_color=color.new(CA,85), frame_color=CF, frame_width=2)
+
+if barstate.islast
+
+    // Computed values
+    conf_str = fmtp(VC)
+    zr_str   = fmtf(z_ret)
+    za_str   = fmtf(z_atr)
+    zs_str   = fmtf(z_slope)
+
+    exp_d0 = array.get(HA,0) < 1.0 ? 1.0 / (1.0 - array.get(HA,0)) : 99.0
+    exp_d1 = array.get(HA,4) < 1.0 ? 1.0 / (1.0 - array.get(HA,4)) : 99.0
+    exp_d2 = array.get(HA,8) < 1.0 ? 1.0 / (1.0 - array.get(HA,8)) : 99.0
+
+    MS  = array.copy(HA)
+    for _si = 0 to stat_pow - 1
+        MS := mm3(MS, HA)
+    st0 = array.get(MS, 0)
+    st1 = array.get(MS, 1)
+    st2 = array.get(MS, 2)
+
+    sl_lbl  = na(sl_mult) ? "N/A" : "ATR x " + str.tostring(sl_mult,"#.#")
+    sl_text = na(sl_val)  ? "N/A" : fmtf(sl_val) + " pts"
+    tp_lbl  = na(sl_mult) ? "N/A" : "RR 1:" + str.tostring(rr_r,"#.#")
+    tp_text = na(tp_val)  ? "N/A" : fmtf(tp_val) + " pts"
+    partial = na(sl_val)  ? "N/A" : fmtf(sl_val) + " pts"
+
+    row = 0  // rolling row counter
+
+    // ── helper: satu baris data ───────────────────────────────────────────
+    // (inline karena Pine tidak bisa pass table sebagai argumen fungsi)
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 1 — SIGNAL (Regime + DST Kalkulasi)
+    // ══════════════════════════════════════════════════════════════════════
+    if sec_signal
+
+        // Header section — full width via same bgcolor di kedua kolom
+        table.cell(TM, 0, row, "SIGNAL & DST KALKULASI", text_color=CK, bgcolor=color.new(CA,20), text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, "XAUUSD", text_color=CK, bgcolor=color.new(CA,20), text_size=sh, text_halign=text.align_right)
+        row += 1
+
+        // Regime
+        reg_bg = color.new(rgc(VR), 55)
+        table.cell(TM, 0, row, "Regime", text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, rgn(VR) + " (" + conf_str + ")", text_color=VR == 0 ? CYW : CDT, bgcolor=reg_bg, text_size=sv, text_halign=text.align_right)
+        row += 1
+
+        // Status
+        table.cell(TM, 0, row, "Status", text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, rgs(VR), text_color=rgsc(VR), bgcolor=CK, text_size=sv, text_halign=text.align_right)
+        row += 1
+
+        // Rekomendasi
+        table.cell(TM, 0, row, "Rekomendasi", text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, rgd(VR), text_color=VR == 0 ? CYW : CWT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        row += 1
+
+        // SL
+        table.cell(TM, 0, row, sl_lbl, text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, "SL: " + sl_text, text_color=CR, bgcolor=CK, text_size=sv, text_halign=text.align_right)
+        row += 1
+
+        // TP
+        table.cell(TM, 0, row, tp_lbl, text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, "TP: " + tp_text, text_color=CDT, bgcolor=CK, text_size=sv, text_halign=text.align_right)
+        row += 1
+
+        // Partial TP
+        table.cell(TM, 0, row, "Partial TP 1:1", text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, partial, text_color=color.new(CDT,30), bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        row += 1
+
+        // Durasi regime
+        table.cell(TM, 0, row, "Durasi Regime", text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, str.tostring(VDUR) + " bar", text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        row += 1
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 2 — TRANSITION MATRIX
+    // ══════════════════════════════════════════════════════════════════════
+    if sec_matrix
+
+        table.cell(TM, 0, row, "TRANSITION MATRIX", text_color=CK, bgcolor=color.new(CB,30), text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, "Persistensi Regime", text_color=CK, bgcolor=color.new(CB,30), text_size=sh, text_halign=text.align_right)
+        row += 1
+
+        // Subheader
+        table.cell(TM, 0, row, "Regime", text_color=CHD, bgcolor=CSH, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, "Tetap | -> BULL | -> BEAR | E[dur]", text_color=CHD, bgcolor=CSH, text_size=sh, text_halign=text.align_center)
+        row += 1
+
+        // Baris SIDE
+        isCur0 = VR == 0
+        p_ss   = array.get(HA, 0*3+0)
+        p_sb   = array.get(HA, 0*3+1)
+        p_sr   = array.get(HA, 0*3+2)
+        rowBg0 = isCur0 ? color.new(CA,80) : CK
+        table.cell(TM, 0, row, "SIDE" + (isCur0 ? " <" : ""), text_color=isCur0 ? CWT : CS, bgcolor=rowBg0, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, fmtp(p_ss) + "  |  " + fmtp(p_sb) + "  |  " + fmtp(p_sr) + "  |  " + fmtd(exp_d0), text_color=isCur0 ? CWT : CDT, bgcolor=isCur0 ? color.new(CA,75) : CDG, text_size=sh, text_halign=text.align_center)
+        row += 1
+
+        // Baris BULL
+        isCur1 = VR == 1
+        p_bs   = array.get(HA, 1*3+0)
+        p_bb   = array.get(HA, 1*3+1)
+        p_br   = array.get(HA, 1*3+2)
+        rowBg1 = isCur1 ? color.new(CA,80) : CK
+        table.cell(TM, 0, row, "BULL" + (isCur1 ? " <" : ""), text_color=isCur1 ? CWT : CB, bgcolor=rowBg1, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, fmtp(p_bs) + "  |  " + fmtp(p_bb) + "  |  " + fmtp(p_br) + "  |  " + fmtd(exp_d1), text_color=isCur1 ? CWT : CDT, bgcolor=isCur1 ? color.new(CA,75) : CDG, text_size=sh, text_halign=text.align_center)
+        row += 1
+
+        // Baris BEAR
+        isCur2 = VR == 2
+        p_rs   = array.get(HA, 2*3+0)
+        p_rb   = array.get(HA, 2*3+1)
+        p_rr   = array.get(HA, 2*3+2)
+        rowBg2 = isCur2 ? color.new(CA,80) : CK
+        table.cell(TM, 0, row, "BEAR" + (isCur2 ? " <" : ""), text_color=isCur2 ? CWT : CR, bgcolor=rowBg2, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, fmtp(p_rs) + "  |  " + fmtp(p_rb) + "  |  " + fmtp(p_rr) + "  |  " + fmtd(exp_d2), text_color=isCur2 ? CWT : CDT, bgcolor=isCur2 ? color.new(CA,75) : CDG, text_size=sh, text_halign=text.align_center)
+        row += 1
+
+        // P(state|obs)
+        table.cell(TM, 0, row, "P(state|obs)", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, "S:" + fmtp(array.get(VP,0)) + "  B:" + fmtp(array.get(VP,1)) + "  R:" + fmtp(array.get(VP,2)), text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        row += 1
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 3 — EMISSION PARAMETERS
+    // ══════════════════════════════════════════════════════════════════════
+    if sec_emit
+
+        table.cell(TM, 0, row, "EMISSION PARAMS", text_color=CK, bgcolor=color.new(CS,30), text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, "mu_ret | mu_atr | mu_slope", text_color=CK, bgcolor=color.new(CS,30), text_size=sh, text_halign=text.align_right)
+        row += 1
+
+        // Subheader
+        table.cell(TM, 0, row, "Regime", text_color=CHD, bgcolor=CSH, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, "return  |  atr  |  slope  |  P(s)", text_color=CHD, bgcolor=CSH, text_size=sh, text_halign=text.align_center)
+        row += 1
+
+        // SIDE emission
+        isCurE0 = VR == 0
+        table.cell(TM, 0, row, "SIDE" + (isCurE0 ? " <" : ""), text_color=isCurE0 ? CWT : CS, bgcolor=isCurE0 ? color.new(CA,80) : CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, fmtf(array.get(HMU,0)) + "  |  " + fmtf(array.get(HMU,1)) + "  |  " + fmtf(array.get(HMU,2)) + "  |  " + fmtp(array.get(VP,0)), text_color=isCurE0 ? CWT : CDT, bgcolor=isCurE0 ? color.new(CA,75) : CK, text_size=sh, text_halign=text.align_center)
+        row += 1
+
+        // BULL emission
+        isCurE1 = VR == 1
+        table.cell(TM, 0, row, "BULL" + (isCurE1 ? " <" : ""), text_color=isCurE1 ? CWT : CB, bgcolor=isCurE1 ? color.new(CA,80) : CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, fmtf(array.get(HMU,3)) + "  |  " + fmtf(array.get(HMU,4)) + "  |  " + fmtf(array.get(HMU,5)) + "  |  " + fmtp(array.get(VP,1)), text_color=isCurE1 ? CWT : CDT, bgcolor=isCurE1 ? color.new(CA,75) : CK, text_size=sh, text_halign=text.align_center)
+        row += 1
+
+        // BEAR emission
+        isCurE2 = VR == 2
+        table.cell(TM, 0, row, "BEAR" + (isCurE2 ? " <" : ""), text_color=isCurE2 ? CWT : CR, bgcolor=isCurE2 ? color.new(CA,80) : CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, fmtf(array.get(HMU,6)) + "  |  " + fmtf(array.get(HMU,7)) + "  |  " + fmtf(array.get(HMU,8)) + "  |  " + fmtp(array.get(VP,2)), text_color=isCurE2 ? CWT : CDT, bgcolor=isCurE2 ? color.new(CA,75) : CK, text_size=sh, text_halign=text.align_center)
+        row += 1
+
+        // Z current
+        table.cell(TM, 0, row, "Z saat ini", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, "ret:" + zr_str + "  atr:" + za_str + "  slp:" + zs_str, text_color=CWT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        row += 1
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 4 — LONG-RUN DISTRIBUTION
+    // ══════════════════════════════════════════════════════════════════════
+    if sec_stat
+
+        table.cell(TM, 0, row, "LONG-RUN DISTRIBUTION", text_color=CK, bgcolor=color.new(CR,40), text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, "Steady State A^" + str.tostring(stat_pow), text_color=CK, bgcolor=color.new(CR,40), text_size=sh, text_halign=text.align_right)
+        row += 1
+
+        table.cell(TM, 0, row, "SIDE | BULL | BEAR", text_color=CHD, bgcolor=CSH, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, "Conf: " + conf_str, text_color=CDT, bgcolor=CSH, text_size=sh, text_halign=text.align_right)
+        row += 1
+
+        table.cell(TM, 0, row, fmtp(st0) + "  |  " + fmtp(st1) + "  |  " + fmtp(st2), text_color=CDT, bgcolor=CDG, text_size=sv, text_halign=text.align_center)
+        table.cell(TM, 1, row, "live", text_color=CA, bgcolor=CDG, text_size=sh, text_halign=text.align_right)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// End of file — DST HMM v2 Mobile Edition
+// ═══════════════════════════════════════════════════════════════════════════
