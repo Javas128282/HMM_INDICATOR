@@ -1,0 +1,701 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════════
+// DST Hidden Markov Model — XAUUSD M5
+// ════════════════════════════════════════════════════════════════════════════
+// Training   : Baum-Welch EM  (Forward-Backward → M-step, warm-started)
+// Decoding   : Viterbi Algorithm (MAP hidden state sequence)
+// Observation: Dynamic Z-Score dari log-return (N(0,1), robust volatilitas)
+//
+// States:
+//   0 = SIDEWAYS  — Konsolidasi, DON'T TRADE
+//   1 = BULL      — Trend naik,  cari setup BUY
+//   2 = BEAR      — Trend turun, cari setup SELL
+//
+// Peningkatan vs DST Markov v1 (threshold-based):
+//   ✅ Baum-Welch training (bukan threshold hard-coded)
+//   ✅ Viterbi decoding (bukan simple argmax emission)
+//   ✅ Z-Score dinamis sebagai observation (bukan raw log-return)
+//   ✅ Emission parameters (μ, σ) ditampilkan — transparan
+//   ✅ Regime confidence dari posterior γ (bukan binary label)
+//   ✅ State ordering post-BW (Bull=μ tinggi, Bear=μ rendah)
+//   ✅ Stationary distribution dari learned A matrix (bukan counting)
+//   ✅ Warm-start BW: parameter dilanjutkan dari bar sebelumnya
+// ════════════════════════════════════════════════════════════════════════════
+indicator("DST Hidden Markov Model - XAUUSD", overlay = true, max_labels_count = 500)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────
+grp_h  = "🧠 HMM Training"
+grp_z  = "📊 Z-Score Observation"
+grp_a  = "📐 ATR & SL/TP"
+grp_d  = "🖥  Display"
+grp_p  = "📌 Table Positions"
+
+hmm_win   = input.int(60,   "Training Window (bars)",      minval=20, maxval=150, group=grp_h,
+            tooltip="Jumlah bar terakhir untuk melatih HMM. 60 bar ≈ 5 jam M5.")
+bw_n      = input.int(5,    "Baum-Welch Iterations",       minval=1,  maxval=15,  group=grp_h,
+            tooltip="Iterasi EM per bar close. 5 sudah cukup dengan warm-start.")
+sig_floor = input.float(0.05,"Min Emission σ (floor)",     minval=0.01, maxval=1.0, step=0.01, group=grp_h,
+            tooltip="Batas bawah std emisi. Cegah distribusi Gaussian collapse.")
+stat_pow  = input.int(30,   "Stationary Power Iterations", minval=10, maxval=100, group=grp_h,
+            tooltip="Iterasi A^n untuk distribusi stasioner. 30 cukup konvergen.")
+
+z_win     = input.int(20,   "Z-Score Window (bars)",       minval=5,  maxval=100, group=grp_z,
+            tooltip="Window rolling untuk mean/std log-return. 20 bar ≈ 100 menit M5.")
+
+atr_len   = input.int(14,   "ATR Length",                  minval=1,  maxval=50,  group=grp_a)
+atr_bull  = input.float(1.2,"ATR Mult - Bull Regime",      minval=0.5, maxval=5.0, step=0.1, group=grp_a)
+atr_bear  = input.float(1.5,"ATR Mult - Bear Regime",      minval=0.5, maxval=5.0, step=0.1, group=grp_a)
+rr_r      = input.float(2.0,"Risk Reward Ratio",           minval=1.0, maxval=10.0, step=0.5, group=grp_a)
+show_sltp = input.bool(true,"Tampilkan DST Kalkulasi",     group=grp_a)
+
+show_rib  = input.bool(true, "Regime Ribbon",              group=grp_d)
+show_warn = input.bool(true, "Sideways Warning",           group=grp_d)
+show_ban  = input.bool(true, "Regime Banner",              group=grp_d)
+show_mat  = input.bool(true, "Transition Matrix",          group=grp_d)
+show_stat = input.bool(true, "Stationary Distribution",    group=grp_d)
+show_emit = input.bool(true, "Emission Parameters",        group=grp_d)
+show_lbl  = input.bool(true, "Label Regime Transitions",   group=grp_d)
+min_hold  = input.int(4,    "Min Hold Bars (debounce)",    minval=1, maxval=50, group=grp_d)
+tsize     = input.string("large","Table Text Size",
+            options=["small","normal","large","huge"],     group=grp_d)
+
+ban_ps = input.string("top_left",   "Banner",     options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group=grp_p)
+mat_ps = input.string("top_right",  "Matrix",     options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group=grp_p)
+stt_ps = input.string("bottom_right","Stationary",options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group=grp_p)
+slt_ps = input.string("bottom_left","SL/TP",      options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group=grp_p)
+emt_ps = input.string("middle_right","Emission",  options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group=grp_p)
+
+// ─── UTILITY HELPERS ─────────────────────────────────────────────────────────
+gpos(s) =>
+    switch s
+        "top_left"      => position.top_left
+        "top_center"    => position.top_center
+        "top_right"     => position.top_right
+        "middle_left"   => position.middle_left
+        "middle_center" => position.middle_center
+        "middle_right"  => position.middle_right
+        "bottom_left"   => position.bottom_left
+        "bottom_center" => position.bottom_center
+        => position.bottom_right
+
+gsz(s) =>
+    switch s
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        => size.huge
+
+gszh(s) =>
+    switch s
+        "huge"  => size.large
+        "large" => size.normal
+        => size.small
+
+// 3×3 matrix multiply (flat 9-element arrays, row-major)
+mm3(A3, B3) =>
+    C3 = array.new_float(9, 0.0)
+    for r3 = 0 to 2
+        for c3 = 0 to 2
+            s3 = 0.0
+            for k3 = 0 to 2
+                s3 += array.get(A3, r3*3+k3) * array.get(B3, k3*3+c3)
+            array.set(C3, r3*3+c3, s3)
+    C3
+
+fmtp(p) => str.tostring(math.round(p * 100)) + "%"
+fmtf(v) => str.tostring(math.round(v * 1000) / 1000.0, "#.###")
+
+sv = gsz(tsize)
+sh = gszh(tsize)
+
+// ─── PALETTE ─────────────────────────────────────────────────────────────────
+CB  = color.rgb(132, 187, 161)     // Bull  — green
+CR  = color.rgb(197, 127, 134)     // Bear  — red
+CS  = color.rgb(164, 171, 183)     // Side  — gray
+CK  = color.new(#0B0F0D, 8)        // Card background
+CF  = color.new(#3FDE7E, 78)       // Frame accent
+CA  = #3FDE7E                      // Accent green
+CDG = color.new(#3FDE7E, 80)       // Diagonal cell bg
+CDT = #6BF0A6                      // Diagonal cell text
+COF = color.new(color.white, 55)   // Off/dim text
+CHD = color.new(color.white, 35)   // Header text
+CFT = color.new(color.white, 60)   // Footer text
+CWN = color.rgb(255, 200, 0, 88)   // Sideways warning
+CWT = color.white
+
+rgc(r) => r == 1 ? CB  : r == 2 ? CR  : CS
+rgn(r) => r == 1 ? "BULL" : r == 2 ? "BEAR" : "SIDEWAYS"
+rgi(r) => r == 1 ? "📈 BULL" : r == 2 ? "📉 BEAR" : "📊 SIDEWAYS"
+rgd(r) =>
+    if r == 1
+        "SL = ATR x" + str.tostring(atr_bull,"#.#") + "  |  IKUTI NAIK"
+    else if r == 2
+        "SL = ATR x" + str.tostring(atr_bear,"#.#") + "  |  IKUTI TURUN"
+    else
+        "SIDEWAYS - DON'T TRADE"
+rgs(r) => r == 1 ? "BIAS BUY" : r == 2 ? "BIAS SELL" : "DON'T TRADE"
+rgsc(r)=> r == 1 ? CB : r == 2 ? CR : color.rgb(255, 200, 0)
+
+// ─── Z-SCORE OBSERVATION ─────────────────────────────────────────────────────
+// log(Ct/Ct-1) dinormalisasi rolling → Z ~ N(0,1)
+// Keunggulan vs raw return:
+//   • Stasioner: tidak terpengaruh level harga
+//   • Unitless: perbandingan antar periode valid
+//   • Gaussian-like: asumsi emisi HMM terpenuhi lebih baik
+lr       = close > 0 and close[1] > 0 ? math.log(close / close[1]) : 0.0
+z_mu_v   = ta.sma(lr, z_win)
+z_sd_v   = ta.stdev(lr, z_win)
+z_cur    = z_sd_v > 1e-10 ? (lr - z_mu_v) / z_sd_v : 0.0
+
+// Rolling observation buffer
+var array<float> OB = array.new_float(0)
+array.push(OB, z_cur)
+if array.size(OB) > hmm_win
+    array.shift(OB)
+
+// ─── HMM PARAMETERS (var — persistent, warm-started) ────────────────────────
+// States: 0=Sideways  1=Bull  2=Bear
+// A[i*3+j] = P(ke state j | dari state i)  (row-major)
+// Initial values berdasarkan domain knowledge XAUUSD:
+//   Bull  : Z-score positif (close lebih tinggi secara konsisten)
+//   Bear  : Z-score negatif
+//   Side  : Z-score ≈ 0, std lebih kecil (konsolidasi)
+var array<float> HP  = array.from(0.40, 0.30, 0.30)          // π  initial probs
+var array<float> HA  = array.from(0.70, 0.15, 0.15, 0.20, 0.65, 0.15, 0.20, 0.15, 0.65)
+var array<float> HMU = array.from( 0.00,  1.20, -1.20)        // μ  emission mean
+var array<float> HSG = array.from( 0.50,  0.90,  0.90)        // σ  emission std
+
+// Output vars
+var int   VR  = 0                                              // Viterbi regime
+var float VC  = 0.40                                           // Viterbi confidence
+var array<float> VP = array.from(0.40, 0.30, 0.30)            // posterior P(state)
+
+// ─── GAUSSIAN PDF ─────────────────────────────────────────────────────────────
+// N(x; μ, σ) — emisi per state
+var float S2PI = math.sqrt(2.0 * math.pi)
+gpdf(x, m, s) =>
+    sv2 = math.max(s, 1e-10)
+    d   = (x - m) / sv2
+    math.exp(-0.5 * d * d) / (sv2 * S2PI)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  MAIN HMM — barstate.islast
+//  Urutan: Baum-Welch → State Ordering → Viterbi → Posterior γ
+// ═════════════════════════════════════════════════════════════════════════════
+if barstate.islast
+    T = math.min(array.size(OB), hmm_win)
+    N = 3
+
+    if T >= 10
+
+        // ╔═══════════════════════════════════════════════════════╗
+        // ║  BAUM-WELCH EM  (bw_n iterations, warm-started)      ║
+        // ║  E-step: Forward-Backward                             ║
+        // ║  M-step: Update π, A, μ, σ                           ║
+        // ╚═══════════════════════════════════════════════════════╝
+        for _it = 0 to bw_n - 1
+
+            // ── Forward pass α (scaled untuk stabilitas numerik) ──
+            al = array.new_float(T * N, 0.0)
+            sc = array.new_float(T, 1e-300)
+
+            // t = 0: inisialisasi
+            s0 = 0.0
+            for s = 0 to N-1
+                v = array.get(HP,s) * gpdf(array.get(OB,0), array.get(HMU,s), array.get(HSG,s))
+                array.set(al, s, v)
+                s0 += v
+            s0 := math.max(s0, 1e-300)
+            array.set(sc, 0, s0)
+            for s = 0 to N-1
+                array.set(al, s, array.get(al, s) / s0)
+
+            // t > 0: rekursi
+            for t = 1 to T-1
+                st = 0.0
+                for s = 0 to N-1
+                    sm = 0.0
+                    for p = 0 to N-1
+                        sm += array.get(al,(t-1)*N+p) * array.get(HA, p*N+s)
+                    v = sm * gpdf(array.get(OB,t), array.get(HMU,s), array.get(HSG,s))
+                    array.set(al, t*N+s, v)
+                    st += v
+                st := math.max(st, 1e-300)
+                array.set(sc, t, st)
+                for s = 0 to N-1
+                    array.set(al, t*N+s, array.get(al, t*N+s) / st)
+
+            // ── Backward pass β (scaled) ───────────────────────────
+            be = array.new_float(T * N, 0.0)
+            for s = 0 to N-1
+                array.set(be, (T-1)*N+s, 1.0 / array.get(sc, T-1))
+
+            for rv = 0 to T-2
+                t   = T-2 - rv
+                sct = array.get(sc, t)
+                for s = 0 to N-1
+                    sm = 0.0
+                    for sn = 0 to N-1
+                        bsn = gpdf(array.get(OB,t+1), array.get(HMU,sn), array.get(HSG,sn))
+                        sm += array.get(HA, s*N+sn) * bsn * array.get(be,(t+1)*N+sn)
+                    array.set(be, t*N+s, sm / sct)
+
+            // ── Gamma γ (state occupancy posterior) ───────────────
+            gm = array.new_float(T * N, 0.0)
+            for t = 0 to T-1
+                gs = 0.0
+                for s = 0 to N-1
+                    g = array.get(al,t*N+s) * array.get(be,t*N+s)
+                    array.set(gm, t*N+s, g)
+                    gs += g
+                gs := math.max(gs, 1e-300)
+                for s = 0 to N-1
+                    array.set(gm, t*N+s, array.get(gm,t*N+s) / gs)
+
+            // ── Xi ξ (joint transition posterior) ─────────────────
+            xi = array.new_float((T-1)*N*N, 0.0)
+            for t = 0 to T-2
+                xs = 0.0
+                for i = 0 to N-1
+                    for j = 0 to N-1
+                        bj = gpdf(array.get(OB,t+1), array.get(HMU,j), array.get(HSG,j))
+                        xv = array.get(al,t*N+i) * array.get(HA,i*N+j) * bj * array.get(be,(t+1)*N+j)
+                        array.set(xi, t*N*N+i*N+j, xv)
+                        xs += xv
+                xs := math.max(xs, 1e-300)
+                for i = 0 to N-1
+                    for j = 0 to N-1
+                        array.set(xi, t*N*N+i*N+j, array.get(xi,t*N*N+i*N+j) / xs)
+
+            // ── M-Step: update π ──────────────────────────────────
+            psum = 0.0
+            for s = 0 to N-1
+                psum += array.get(gm, s)
+            psum := math.max(psum, 1e-300)
+            for s = 0 to N-1
+                array.set(HP, s, array.get(gm, s) / psum)
+
+            // ── M-Step: update A ──────────────────────────────────
+            for i = 0 to N-1
+                di = 0.0
+                for t = 0 to T-2
+                    di += array.get(gm, t*N+i)
+                for j = 0 to N-1
+                    nij = 0.0
+                    for t = 0 to T-2
+                        nij += array.get(xi, t*N*N+i*N+j)
+                    array.set(HA, i*N+j, math.max(di > 1e-300 ? nij/di : 1.0/N, 1e-8))
+                rs = 0.0
+                for j = 0 to N-1
+                    rs += array.get(HA, i*N+j)
+                if rs > 0
+                    for j = 0 to N-1
+                        array.set(HA, i*N+j, array.get(HA,i*N+j) / rs)
+
+            // ── M-Step: update μ dan σ ─────────────────────────────
+            for s = 0 to N-1
+                gs2 = 0.0
+                wm  = 0.0
+                for t = 0 to T-1
+                    g   = array.get(gm, t*N+s)
+                    gs2 += g
+                    wm  += g * array.get(OB, t)
+                mu_n = gs2 > 1e-300 ? wm / gs2 : array.get(HMU, s)
+                array.set(HMU, s, mu_n)
+                wv = 0.0
+                for t = 0 to T-1
+                    g    = array.get(gm, t*N+s)
+                    diff = array.get(OB, t) - mu_n
+                    wv  += g * diff * diff
+                array.set(HSG, s, math.max(gs2 > 1e-300 ? math.sqrt(wv/gs2) : array.get(HSG,s), float(sig_floor)))
+
+        // ╔═══════════════════════════════════════════════════════╗
+        // ║  STATE LABEL ORDERING (post-BW disambiguation)       ║
+        // ║  Pastikan: state 1 = Bull (μ max), state 2 = Bear (μ min)  ║
+        // ║  Mencegah label switching setelah konvergensi BW     ║
+        // ╚═══════════════════════════════════════════════════════╝
+        m0_v = array.get(HMU, 0)
+        m1_v = array.get(HMU, 1)
+        m2_v = array.get(HMU, 2)
+
+        bull_id = m0_v >= m1_v and m0_v >= m2_v ? 0 : m1_v >= m2_v ? 1 : 2
+        bear_id = m0_v <= m1_v and m0_v <= m2_v ? 0 : m1_v <= m2_v ? 1 : 2
+        side_id = bull_id == bear_id ? 2 : 3 - bull_id - bear_id
+
+        // Reorder hanya jika ordering sudah berubah
+        if not (bull_id == 1 and bear_id == 2 and side_id == 0)
+            mp  = array.new_int(3, 0)
+            array.set(mp, 0, side_id)
+            array.set(mp, 1, bull_id)
+            array.set(mp, 2, bear_id)
+            tmu = array.new_float(3, 0.0)
+            tsg = array.new_float(3, 0.0)
+            tpi = array.new_float(3, 0.0)
+            tA  = array.new_float(9, 0.0)
+            for ni = 0 to 2
+                oi = array.get(mp, ni)
+                array.set(tmu, ni, array.get(HMU, oi))
+                array.set(tsg, ni, array.get(HSG, oi))
+                array.set(tpi, ni, array.get(HP,  oi))
+            for ni = 0 to 2
+                oi = array.get(mp, ni)
+                for nj = 0 to 2
+                    oj = array.get(mp, nj)
+                    array.set(tA, ni*3+nj, array.get(HA, oi*3+oj))
+            for s = 0 to 2
+                array.set(HMU, s, array.get(tmu, s))
+                array.set(HSG, s, array.get(tsg, s))
+                array.set(HP,  s, array.get(tpi, s))
+            for idx = 0 to 8
+                array.set(HA, idx, array.get(tA, idx))
+
+        // ╔═══════════════════════════════════════════════════════╗
+        // ║  VITERBI DECODING                                     ║
+        // ║  Temukan urutan state tersembunyi yang paling optimal ║
+        // ║  δ_t(s) = max P(q_1..q_t, o_1..o_t, q_t=s)          ║
+        // ╚═══════════════════════════════════════════════════════╝
+        dl  = array.new_float(T * N, 0.0)
+        psi = array.new_int(T * N, 0)
+
+        // t=0
+        d0s = 0.0
+        for s = 0 to N-1
+            v = array.get(HP,s) * gpdf(array.get(OB,0), array.get(HMU,s), array.get(HSG,s))
+            array.set(dl, s, v)
+            d0s += v
+        d0s := math.max(d0s, 1e-300)
+        for s = 0 to N-1
+            array.set(dl, s, array.get(dl, s) / d0s)
+
+        // Rekursi Viterbi
+        for t = 1 to T-1
+            dts = 0.0
+            for s = 0 to N-1
+                mv = -1.0
+                mi = 0
+                for p2 = 0 to N-1
+                    v = array.get(dl,(t-1)*N+p2) * array.get(HA, p2*N+s)
+                    if v > mv
+                        mv := v
+                        mi := p2
+                b2 = gpdf(array.get(OB,t), array.get(HMU,s), array.get(HSG,s))
+                dv = mv * b2
+                array.set(dl,  t*N+s, dv)
+                array.set(psi, t*N+s, mi)
+                dts += dv
+            dts := math.max(dts, 1e-300)
+            for s = 0 to N-1
+                array.set(dl, t*N+s, array.get(dl,t*N+s) / dts)
+
+        // Backtracking
+        vpath = array.new_int(T, 0)
+        lmx   = -1.0
+        ls    = 0
+        for s = 0 to N-1
+            if array.get(dl,(T-1)*N+s) > lmx
+                lmx := array.get(dl,(T-1)*N+s)
+                ls  := s
+        array.set(vpath, T-1, ls)
+        for rv2 = 0 to T-2
+            t = T-2 - rv2
+            array.set(vpath, t, array.get(psi,(t+1)*N + array.get(vpath,t+1)))
+
+        VR := array.get(vpath, T-1)
+
+        // ╔═══════════════════════════════════════════════════════╗
+        // ║  POSTERIOR γ (satu pass F-B terakhir)                ║
+        // ║  Menggunakan parameter konvergen untuk probabilitas   ║
+        // ╚═══════════════════════════════════════════════════════╝
+        a2  = array.new_float(T * N, 0.0)
+        s2  = array.new_float(T, 1e-300)
+        s0b = 0.0
+        for s = 0 to N-1
+            v = array.get(HP,s) * gpdf(array.get(OB,0), array.get(HMU,s), array.get(HSG,s))
+            array.set(a2, s, v)
+            s0b += v
+        s0b := math.max(s0b, 1e-300)
+        array.set(s2, 0, s0b)
+        for s = 0 to N-1
+            array.set(a2, s, array.get(a2,s) / s0b)
+        for t = 1 to T-1
+            stb = 0.0
+            for s = 0 to N-1
+                sm = 0.0
+                for p3 = 0 to N-1
+                    sm += array.get(a2,(t-1)*N+p3) * array.get(HA,p3*N+s)
+                v = sm * gpdf(array.get(OB,t), array.get(HMU,s), array.get(HSG,s))
+                array.set(a2, t*N+s, v)
+                stb += v
+            stb := math.max(stb, 1e-300)
+            array.set(s2, t, stb)
+            for s = 0 to N-1
+                array.set(a2, t*N+s, array.get(a2,t*N+s) / stb)
+
+        b2  = array.new_float(T * N, 0.0)
+        for s = 0 to N-1
+            array.set(b2,(T-1)*N+s, 1.0 / array.get(s2, T-1))
+        for rv3 = 0 to T-2
+            t   = T-2 - rv3
+            sct = array.get(s2, t)
+            for s = 0 to N-1
+                sm = 0.0
+                for sn = 0 to N-1
+                    bsn = gpdf(array.get(OB,t+1), array.get(HMU,sn), array.get(HSG,sn))
+                    sm += array.get(HA,s*N+sn) * bsn * array.get(b2,(t+1)*N+sn)
+                array.set(b2, t*N+s, sm / sct)
+
+        // Posterior bar terakhir
+        gf = 0.0
+        for s = 0 to N-1
+            g = array.get(a2,(T-1)*N+s) * array.get(b2,(T-1)*N+s)
+            array.set(VP, s, g)
+            gf += g
+        gf := math.max(gf, 1e-300)
+        for s = 0 to N-1
+            array.set(VP, s, array.get(VP,s) / gf)
+        VC := array.get(VP, VR)
+
+// ─── INSTANTANEOUS REGIME (per bar, untuk ribbon/label) ──────────────────────
+// Argmax emisi × prior dengan parameter post-BW
+// Lebih akurat dari threshold, update setiap bar
+p0i = gpdf(z_cur, array.get(HMU,0), array.get(HSG,0)) * array.get(HP,0)
+p1i = gpdf(z_cur, array.get(HMU,1), array.get(HSG,1)) * array.get(HP,1)
+p2i = gpdf(z_cur, array.get(HMU,2), array.get(HSG,2)) * array.get(HP,2)
+IR  = p1i >= p0i and p1i >= p2i ? 1 : p2i >= p0i and p2i >= p1i ? 2 : 0
+
+// ─── REGIME RIBBON & WARNING ─────────────────────────────────────────────────
+rib_col = IR == 1 ? color.new(CB, 30) : IR == 2 ? color.new(CR, 30) : color.new(CS, 30)
+bgcolor(show_rib  ? rib_col : na, title="Regime Ribbon")
+bgcolor(show_warn and IR == 0 ? CWN : na, title="Sideways Warning")
+
+// ─── TRANSITION LABELS (debounced dengan min_hold) ────────────────────────────
+var int LR = na
+held = not na(IR)
+for k = 0 to min_hold - 1
+    held := held and not na(IR[k]) and IR[k] == IR
+
+if barstate.isconfirmed and not na(IR) and held and IR != LR
+    if show_lbl and not na(LR)
+        fo = min_hold - 1
+        label.new(bar_index - fo, high[fo],
+             rgn(LR) + " → " + rgn(IR),
+             yloc=yloc.abovebar, style=label.style_label_down,
+             color=rgc(IR), textcolor=CWT, size=size.normal)
+    LR := IR
+
+// ─── ATR & SL/TP ─────────────────────────────────────────────────────────────
+atr_v   = ta.atr(atr_len)
+sl_mult = VR == 1 ? atr_bull : VR == 2 ? atr_bear : float(na)
+sl_val  = na(sl_mult) ? float(na) : atr_v * sl_mult
+tp_val  = na(sl_val)  ? float(na) : sl_val * rr_r
+
+// ─── TABLE DECLARATIONS ──────────────────────────────────────────────────────
+var table TBAN = table.new(gpos(ban_ps), 1, 4, bgcolor=color.new(color.black,30), border_width=0)
+var table TMAT = table.new(gpos(mat_ps), 5, 7, bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
+var table TSTT = table.new(gpos(stt_ps), 4, 5, bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
+var table TSLT = table.new(gpos(slt_ps), 2, 6, bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
+var table TEMT = table.new(gpos(emt_ps), 4, 5, bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
+
+// ─── TABLE POPULATION ────────────────────────────────────────────────────────
+if barstate.islast
+    // Stationary distribution via A^stat_pow
+    MS  = array.copy(HA)
+    for _si = 0 to stat_pow - 1
+        MS := mm3(MS, HA)
+    st0 = array.get(MS, 0)  // P(Sideways) long-run
+    st1 = array.get(MS, 1)  // P(Bull)     long-run
+    st2 = array.get(MS, 2)  // P(Bear)     long-run
+
+    conf_str = fmtp(VC)
+    z_str    = str.tostring(math.round(z_cur * 100) / 100.0, "#.##")
+    atr_str  = str.tostring(math.round(atr_v * 100) / 100.0, "#.##")
+
+    // ── BANNER ───────────────────────────────────────────────────────
+    if show_ban
+        table.cell(TBAN, 0, 0, "HMM Regime: " + rgi(VR),
+             text_color=CWT, bgcolor=color.new(rgc(VR), 30),
+             text_size=gsz("large"), text_halign=text.align_center)
+        table.cell(TBAN, 0, 1, rgd(VR),
+             text_color=VR == 0 ? color.rgb(255,200,0) : CWT,
+             bgcolor=color.new(color.black, 50),
+             text_size=sh, text_halign=text.align_center)
+        table.cell(TBAN, 0, 2,
+             "Confidence: " + conf_str + "  |  Viterbi MAP  |  Z = " + z_str,
+             text_color=CDT, bgcolor=color.new(color.black, 60),
+             text_size=sh, text_halign=text.align_center)
+        table.cell(TBAN, 0, 3,
+             "ATR(" + str.tostring(atr_len) + ") = " + atr_str +
+             "  |  window = " + str.tostring(hmm_win) + "b  |  BW = " + str.tostring(bw_n) + "it",
+             text_color=CFT, bgcolor=color.new(color.black, 65),
+             text_size=sh, text_halign=text.align_center)
+
+    // ── TRANSITION MATRIX ────────────────────────────────────────────
+    if show_mat
+        table.cell(TMAT, 0, 0, "HMM TRANSITION MATRIX",
+             text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TMAT, 1, 0, "", text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TMAT, 2, 0, "", text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TMAT, 3, 0, "", text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TMAT, 4, 0, "Baum-Welch",
+             text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+
+        table.cell(TMAT, 0, 1, "DARI \\ KE", text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TMAT, 1, 1, "SIDE", text_color=CS,  bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TMAT, 2, 1, "BULL", text_color=CB,  bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TMAT, 3, 1, "BEAR", text_color=CR,  bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TMAT, 4, 1, "P(stay)", text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+
+        rnames = array.new_string(3, "")
+        array.set(rnames, 0, "SIDE")
+        array.set(rnames, 1, "BULL")
+        array.set(rnames, 2, "BEAR")
+        for r3 = 0 to 2
+            isCur = r3 == VR
+            rowBg = isCur ? color.new(CA, 78) : CK
+            table.cell(TMAT, 0, r3+2, array.get(rnames, r3),
+                 text_color=isCur ? CWT : CHD, bgcolor=rowBg, text_size=sh)
+            for c3 = 0 to 2
+                p3     = array.get(HA, r3*3+c3)
+                isDiag = r3 == c3
+                isHi   = isCur and c3 == VR
+                cBg    = isHi ? color.new(color.yellow, 40) : isDiag ? CDG : CK
+                cTxt   = isDiag ? CDT : (isCur ? CWT : COF)
+                table.cell(TMAT, c3+1, r3+2, fmtp(p3),
+                     text_color=cTxt, bgcolor=cBg, text_size=sh, text_halign=text.align_center)
+            table.cell(TMAT, 4, r3+2, fmtp(array.get(HA, r3*3+r3)),
+                 text_color=CDT, bgcolor=CDG, text_size=sh, text_halign=text.align_center)
+
+        // Row 5: posterior P(state) saat ini
+        table.cell(TMAT, 0, 5, "P(state|obs)",
+             text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TMAT, 1, 5, fmtp(array.get(VP,0)),
+             text_color=CS, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TMAT, 2, 5, fmtp(array.get(VP,1)),
+             text_color=CB, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TMAT, 3, 5, fmtp(array.get(VP,2)),
+             text_color=CR, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TMAT, 4, 5, "γ(T)",
+             text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+
+        table.cell(TMAT, 0, 6, "next-state P",
+             text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TMAT, 1, 6, "", text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TMAT, 2, 6, "", text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TMAT, 3, 6, "", text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TMAT, 4, 6, "live HMM",
+             text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+
+    // ── EMISSION PARAMETERS ──────────────────────────────────────────
+    // Menampilkan apa yang dipelajari HMM: pola Z-score per regime
+    if show_emit
+        table.cell(TEMT, 0, 0, "EMISSION  (learned)",
+             text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TEMT, 1, 0, "μ (Z-score)", text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TEMT, 2, 0, "σ (std)",     text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TEMT, 3, 0, "P(state)",    text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+
+        enames = array.new_string(3, "")
+        array.set(enames, 0, "SIDE")
+        array.set(enames, 1, "BULL")
+        array.set(enames, 2, "BEAR")
+        ecols  = array.new_color(3, CS)
+        array.set(ecols, 0, CS)
+        array.set(ecols, 1, CB)
+        array.set(ecols, 2, CR)
+        for s5 = 0 to 2
+            isCur5 = s5 == VR
+            rowBg5 = isCur5 ? color.new(CA, 80) : CK
+            ec     = array.get(ecols, s5)
+            table.cell(TEMT, 0, s5+1, array.get(enames, s5) + (isCur5 ? " ◀" : ""),
+                 text_color=isCur5 ? CWT : ec, bgcolor=rowBg5, text_size=sh)
+            table.cell(TEMT, 1, s5+1,
+                 fmtf(array.get(HMU, s5)),
+                 text_color=isCur5 ? CWT : CDT, bgcolor=rowBg5, text_size=sh, text_halign=text.align_center)
+            table.cell(TEMT, 2, s5+1,
+                 fmtf(array.get(HSG, s5)),
+                 text_color=isCur5 ? CWT : COF, bgcolor=rowBg5, text_size=sh, text_halign=text.align_center)
+            table.cell(TEMT, 3, s5+1,
+                 fmtp(array.get(VP, s5)) + (isCur5 ? " ★" : ""),
+                 text_color=isCur5 ? color.yellow : COF, bgcolor=rowBg5, text_size=sh, text_halign=text.align_center)
+
+        table.cell(TEMT, 0, 4, "Z saat ini: " + z_str,
+             text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TEMT, 1, 4, "win=" + str.tostring(z_win),
+             text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TEMT, 2, 4, "floor σ=" + str.tostring(sig_floor,"#.##"),
+             text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TEMT, 3, 4, "BW=" + str.tostring(bw_n) + "it",
+             text_color=CA,  bgcolor=CK, text_size=sh, text_halign=text.align_right)
+
+    // ── STATIONARY DISTRIBUTION ──────────────────────────────────────
+    if show_stat
+        table.cell(TSTT, 0, 0, "LONG-RUN DISTRIBUTION",
+             text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TSTT, 1, 0, "",  text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TSTT, 2, 0, "",  text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TSTT, 3, 0, "A^" + str.tostring(stat_pow),
+             text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+
+        table.cell(TSTT, 0, 1, "SIDE", text_color=CS,  bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TSTT, 1, 1, "BULL", text_color=CB,  bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TSTT, 2, 1, "BEAR", text_color=CR,  bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TSTT, 3, 1, "CONF", text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+
+        table.cell(TSTT, 0, 2, fmtp(st0), text_color=CDT, bgcolor=CDG, text_size=sv, text_halign=text.align_center, text_valign=text.align_center)
+        table.cell(TSTT, 1, 2, fmtp(st1), text_color=CDT, bgcolor=CDG, text_size=sv, text_halign=text.align_center, text_valign=text.align_center)
+        table.cell(TSTT, 2, 2, fmtp(st2), text_color=CDT, bgcolor=CDG, text_size=sv, text_halign=text.align_center, text_valign=text.align_center)
+        table.cell(TSTT, 3, 2, conf_str,  text_color=CDT, bgcolor=CDG, text_size=sv, text_halign=text.align_center, text_valign=text.align_center)
+
+        table.cell(TSTT, 0, 3, "steady state - distribusi jangka panjang",
+             text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TSTT, 1, 3, "", text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TSTT, 2, 3, "", text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TSTT, 3, 3, "live", text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+
+        table.cell(TSTT, 0, 4, "current γ",
+             text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TSTT, 1, 4, fmtp(array.get(VP,0)),
+             text_color=CS, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TSTT, 2, 4, fmtp(array.get(VP,1)),
+             text_color=CB, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TSTT, 3, 4, fmtp(array.get(VP,2)),
+             text_color=CR, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+
+    // ── DST KALKULASI ─────────────────────────────────────────────────
+    if show_sltp
+        table.cell(TSLT, 0, 0, "DST KALKULASI",
+             text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TSLT, 1, 0, "XAUUSD",
+             text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+
+        table.cell(TSLT, 0, 1, "Regime",
+             text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1, 1, rgn(VR) + " (" + conf_str + ")",
+             text_color=VR == 0 ? color.rgb(255,200,0) : CDT,
+             bgcolor=CK, text_size=sv, text_halign=text.align_right)
+
+        sl_lbl  = na(sl_mult) ? "N/A" : "ATR x " + str.tostring(sl_mult,"#.#")
+        sl_text = na(sl_val)  ? "N/A" : str.tostring(math.round(sl_val*100)/100.0,"#.##") + " pts"
+        table.cell(TSLT, 0, 2, sl_lbl,
+             text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1, 2, "SL: " + sl_text,
+             text_color=CR, bgcolor=CK, text_size=sv, text_halign=text.align_right)
+
+        tp_lbl  = na(sl_mult) ? "N/A" : "RR 1:" + str.tostring(rr_r,"#.#")
+        tp_text = na(tp_val)  ? "N/A" : str.tostring(math.round(tp_val*100)/100.0,"#.##") + " pts"
+        table.cell(TSLT, 0, 3, tp_lbl,
+             text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1, 3, "TP: " + tp_text,
+             text_color=CDT, bgcolor=CK, text_size=sv, text_halign=text.align_right)
+
+        partial = na(sl_val) ? "N/A" : str.tostring(math.round(sl_val*100)/100.0,"#.##") + " pts"
+        table.cell(TSLT, 0, 4, "Partial TP 1:1",
+             text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1, 4, partial,
+             text_color=color.new(CDT, 30), bgcolor=CK, text_size=sh, text_halign=text.align_right)
+
+        table.cell(TSLT, 0, 5, "STATUS",
+             text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1, 5, rgs(VR),
+             text_color=rgsc(VR), bgcolor=CK, text_size=sv, text_halign=text.align_right)
+// ═══════════════════════════════════════════════════════════════════════ END
