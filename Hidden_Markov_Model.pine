@@ -1,18 +1,17 @@
 //@version=6
 // ═══════════════════════════════════════════════════════════════════════════
-// DST Hidden Markov Model v2 — XAUUSD M5
+// DST Hidden Markov Model v2 — XAUUSD H1 (Regularized MAP)
 // ═══════════════════════════════════════════════════════════════════════════
 // Training   : Baum-Welch EM  (multivariate, diagonal covariance)
 // Decoding   : Log-Viterbi  (numerically stabil di log-space)
 // Observation: D=3 features — Return Z, ATR Z, EMA Slope Z
 // Duration   : Geometric model + minimum duration smoothing
 //
-// Upgrade dari v1:
-//   [+] ATR Z-score     — volatilitas sebagai fitur observasi
-//   [+] EMA Slope Z     — arah trend sebagai fitur observasi
-//   [+] Multivariate Gaussian emission (diagonal covariance, D=3)
-//   [+] Log-Viterbi     — log-space, tahan underflow sequence panjang
-//   [+] Duration Model  — E[dur] per state + minimum duration smoothing
+// Upgrade dari v2 M5:
+//   [+] Regularization Strength (MAP prior blending)
+//   [+] Min State Occupancy (skip update jika state jarang)
+//   [+] PRIOR_MU / PRIOR_SG — domain knowledge XAUUSD sebagai anchor
+//   [+] Adaptive regularization — semakin jarang → tarikan prior makin kuat
 // ═══════════════════════════════════════════════════════════════════════════
 indicator("DST HMM v2 - XAUUSD (Multivariate)", overlay = true, max_labels_count = 500)
 
@@ -32,6 +31,16 @@ min_dur_s   = input.int(3,    "Min Duration - Sideways (bars)", minval=1, maxval
               tooltip="Minimum bars sebelum keluar dari regime Sideways")
 min_dur_b   = input.int(2,    "Min Duration - Bull/Bear (bars)",minval=1, maxval=20, group=grp_h,
               tooltip="Minimum bars sebelum regime Bull/Bear berubah")
+
+// PERUBAHAN 1: Input baru — Regularization & Min Occupancy
+reg_str   = input.float(0.15, "Regularization Strength",
+            minval=0.0, maxval=0.5, step=0.05, group=grp_h,
+            tooltip="0 = pure BW (tidak ada prior). 0.15-0.25 direkomendasikan untuk H1. " +
+                    "Mencegah parameter drift saat state jarang dikunjungi.")
+min_occ   = input.float(0.05, "Min State Occupancy (%)",
+            minval=0.01, maxval=0.3, step=0.01, group=grp_h,
+            tooltip="Minimum total gamma per state sebagai % dari T. " +
+                    "State di bawah threshold tidak di-update parameternya.")
 
 z_win       = input.int(20,   "Z-Score Window",              minval=5,  maxval=100, group=grp_f,
               tooltip="Window rolling untuk normalisasi semua 3 fitur")
@@ -136,24 +145,18 @@ rgsc(r) => r == 1 ? CB : r == 2 ? CR : color.rgb(255, 200, 0)
 
 // ─── FEATURE COMPUTATION  (D = 3 observasi) ──────────────────────────────────
 // Feature 0: Return Z-score
-//   log(Ct/Ct-1) dinormalisasi → menangkap momentum harga
 lr      = close > 0 and close[1] > 0 ? math.log(close / close[1]) : 0.0
 lr_mu   = ta.sma(lr, z_win)
 lr_sd   = ta.stdev(lr, z_win)
 z_ret   = lr_sd > 1e-10 ? (lr - lr_mu) / lr_sd : 0.0
 
 // Feature 1: ATR Z-score
-//   ATR tinggi (z>0) = volatilitas naik = keluar dari sideways / trending kuat
-//   ATR rendah (z<0) = volatilitas rendah = konsolidasi / sideways
 atr_raw  = ta.atr(atr_len_f)
 atr_mu   = ta.sma(atr_raw, z_win)
 atr_sd   = ta.stdev(atr_raw, z_win)
 z_atr    = atr_sd > 1e-10 ? (atr_raw - atr_mu) / atr_sd : 0.0
 
 // Feature 2: EMA Slope Z-score
-//   Slope positif (z>0) = EMA naik = Bull
-//   Slope negatif (z<0) = EMA turun = Bear
-//   Slope ~0            = EMA datar = Sideways
 ema_val   = ta.ema(close, ema_len)
 slope_raw = atr_raw > 1e-10 ? (ema_val - ema_val[slope_per]) / (slope_per * atr_raw) : 0.0
 slope_mu  = ta.sma(slope_raw, z_win)
@@ -174,11 +177,6 @@ if array.size(OB1) > hmm_win
     array.shift(OB3)
 
 // ─── HMM PARAMETERS (multivariate, diagonal covariance) ─────────────────────
-// Layout HMU/HSG: [s*3+d] = state s, feature d
-// Inisialisasi domain knowledge XAUUSD:
-//   SIDE : return~0, ATR rendah (z<0), slope~0
-//   BULL : return>0, ATR naik  (z>0), slope>0
-//   BEAR : return<0, ATR naik  (z>0), slope<0
 var array<float> HP  = array.from(0.40, 0.30, 0.30)
 var array<float> HA  = array.from(0.70, 0.15, 0.15, 0.20, 0.65, 0.15, 0.20, 0.15, 0.65)
 var array<float> HMU = array.from(
@@ -190,15 +188,25 @@ var array<float> HSG = array.from(
     0.9, 1.0, 0.9,
     0.9, 1.0, 0.9)
 
+// PERUBAHAN 2: Prior arrays — domain knowledge XAUUSD sebagai anchor
+// Layout: [s0_d0, s0_d1, s0_d2, s1_d0, s1_d1, s1_d2, s2_d0, s2_d1, s2_d2]
+// State: 0=SIDE, 1=BULL, 2=BEAR  |  Feature: 0=ret, 1=atr, 2=slope
+var array<float> PRIOR_MU = array.from(
+     0.0, -0.5,  0.0,   // SIDE:  return~0, ATR rendah, slope~0
+     1.2,  0.5,  1.0,   // BULL:  return+, ATR naik,   slope+
+    -1.2,  0.5, -1.0)   // BEAR:  return-, ATR naik,   slope-
+var array<float> PRIOR_SG = array.from(
+    0.5, 0.7, 0.5,      // SIDE: spread kecil
+    0.9, 1.0, 0.9,      // BULL: spread normal
+    0.9, 1.0, 0.9)      // BEAR: spread normal
+
 // Output vars
 var int   VR  = 0
 var float VC  = 0.40
 var array<float> VP = array.from(0.40, 0.30, 0.30)
-var int   VDUR = 0   // current regime duration (bars)
+var int   VDUR = 0
 
 // ─── EMISSION FUNCTIONS ──────────────────────────────────────────────────────
-// Log multivariate diagonal Gaussian: log N(x; mu_s, diag(sig_s))
-// = -D/2*log(2pi) - sum_d [log(sig_sd) + 0.5*(x_d-mu_sd)^2/sig_sd^2]
 var float LG2PI3 = 1.5 * math.log(2.0 * math.pi)
 
 log_mvg(o1, o2, o3, s) =>
@@ -210,7 +218,6 @@ log_mvg(o1, o2, o3, s) =>
     d2  = (o3 - array.get(HMU, s*3+2)) / s2
     -math.log(s0) - math.log(s1) - math.log(s2) - 0.5*(d0*d0 + d1*d1 + d2*d2) - LG2PI3
 
-// PDF version (for scaled BW)
 mvg_pdf(o1, o2, o3, s) =>
     lv = log_mvg(o1, o2, o3, s)
     lv > -500.0 ? math.exp(lv) : 1e-200
@@ -322,30 +329,57 @@ if barstate.islast
                     for j = 0 to N-1
                         array.set(HA, i*N+j, array.get(HA, i*N+j) / rs)
 
-            // ── M-Step: mu, sigma (multivariate) ──────────────────
-            // Untuk setiap state s dan feature d secara terpisah
+            // PERUBAHAN 3: M-Step mu, sigma — MAP regularization + min occupancy
+            // ── M-Step: mu, sigma (multivariate + regularization) ──
             for s = 0 to N-1
+                // Hitung total gamma state ini
                 gs2 = 0.0
                 for t = 0 to T-1
                     gs2 += array.get(gm, t*N+s)
 
-                for d = 0 to 2
-                    wm = 0.0
-                    for t = 0 to T-1
-                        g    = array.get(gm, t*N+s)
-                        obs_d = d == 0 ? array.get(OB1,t) : d == 1 ? array.get(OB2,t) : array.get(OB3,t)
-                        wm += g * obs_d
-                    mu_nd = gs2 > 1e-300 ? wm / gs2 : array.get(HMU, s*3+d)
-                    array.set(HMU, s*3+d, mu_nd)
+                // MINIMUM OCCUPANCY CHECK
+                // Jika state terlalu jarang dikunjungi, skip update
+                // Parameter dipertahankan dari iterasi sebelumnya
+                if gs2 >= float(T) * min_occ
 
-                    wv = 0.0
-                    for t = 0 to T-1
-                        g     = array.get(gm, t*N+s)
-                        obs_d = d == 0 ? array.get(OB1,t) : d == 1 ? array.get(OB2,t) : array.get(OB3,t)
-                        diff  = obs_d - mu_nd
-                        wv   += g * diff * diff
-                    sig_nd = gs2 > 1e-300 ? math.sqrt(wv / gs2) : array.get(HSG, s*3+d)
-                    array.set(HSG, s*3+d, math.max(sig_nd, float(sig_floor)))
+                    for d = 0 to 2
+                        // ── Update mu ──────────────────────────────
+                        wm = 0.0
+                        for t = 0 to T-1
+                            g     = array.get(gm, t*N+s)
+                            obs_d = d == 0 ? array.get(OB1,t) : d == 1 ? array.get(OB2,t) : array.get(OB3,t)
+                            wm += g * obs_d
+                        mu_bw = wm / gs2
+
+                        // MAP: blend BW estimate dengan prior
+                        // Semakin jarang state muncul → semakin kuat tarikan ke prior
+                        // Semakin sering muncul → BW mendominasi
+                        occupancy_weight = math.min(gs2 / float(T), 1.0)
+                        adaptive_reg     = reg_str * (1.0 - occupancy_weight)
+                        mu_nd = (1.0 - adaptive_reg) * mu_bw + adaptive_reg * array.get(PRIOR_MU, s*3+d)
+                        array.set(HMU, s*3+d, mu_nd)
+
+                        // ── Update sigma ────────────────────────────
+                        wv = 0.0
+                        for t = 0 to T-1
+                            g     = array.get(gm, t*N+s)
+                            obs_d = d == 0 ? array.get(OB1,t) : d == 1 ? array.get(OB2,t) : array.get(OB3,t)
+                            diff  = obs_d - mu_nd
+                            wv   += g * diff * diff
+                        sg_bw = math.sqrt(wv / gs2)
+
+                        // MAP: blend sigma dengan prior
+                        sg_nd = (1.0 - adaptive_reg) * sg_bw + adaptive_reg * array.get(PRIOR_SG, s*3+d)
+                        array.set(HSG, s*3+d, math.max(sg_nd, float(sig_floor)))
+
+                // Jika occupancy terlalu rendah: hanya regularize ke prior
+                // (tarik perlahan ke prior tanpa update dari data)
+                else
+                    for d = 0 to 2
+                        mu_cur = array.get(HMU, s*3+d)
+                        sg_cur = array.get(HSG, s*3+d)
+                        array.set(HMU, s*3+d, 0.7 * mu_cur + 0.3 * array.get(PRIOR_MU, s*3+d))
+                        array.set(HSG, s*3+d, math.max(0.7 * sg_cur + 0.3 * array.get(PRIOR_SG, s*3+d), float(sig_floor)))
 
         // ╔═════════════════════════════════════════════════════════╗
         // ║  STATE LABEL ORDERING                                   ║
@@ -392,22 +426,16 @@ if barstate.islast
 
         // ╔═════════════════════════════════════════════════════════╗
         // ║  LOG-VITERBI DECODING                                   ║
-        // ║  log delta_t(s) = max_p[log delta_{t-1}(p)             ║
-        // ║                        + log A(p,s)]                   ║
-        // ║                 + log mvg(x_t | s)                     ║
-        // ║  Numerically stabil — tidak ada underflow               ║
         // ╚═════════════════════════════════════════════════════════╝
         NEG_INF = -1e30
         log_dl  = array.new_float(T * N, NEG_INF)
         psi_v   = array.new_int(T * N, 0)
 
-        // t=0: log delta
         for s = 0 to N-1
             lp_s  = array.get(HP, s) > 1e-300 ? math.log(array.get(HP, s)) : -500.0
             lb_s  = log_mvg(array.get(OB1,0), array.get(OB2,0), array.get(OB3,0), s)
             array.set(log_dl, s, lp_s + lb_s)
 
-        // t > 0: max over previous states in log-space
         for t = 1 to T-1
             for s = 0 to N-1
                 max_lv = NEG_INF
@@ -422,7 +450,6 @@ if barstate.islast
                 array.set(log_dl, t*N+s, max_lv + lb_s)
                 array.set(psi_v,  t*N+s, max_pv)
 
-        // Backtracking dari T-1
         vpath = array.new_int(T, 0)
         lmx   = NEG_INF
         ls    = 0
@@ -437,8 +464,6 @@ if barstate.islast
 
         // ╔═════════════════════════════════════════════════════════╗
         // ║  DURATION MODEL — Minimum Duration Smoothing            ║
-        // ║  Hapus transisi yang terlalu singkat (blip removal)     ║
-        // ║  Forward pass: jika durasi < min_dur, tahan transisi    ║
         // ╚═════════════════════════════════════════════════════════╝
         cur_state = array.get(vpath, 0)
         cur_dur   = 1
@@ -447,7 +472,6 @@ if barstate.islast
             if nxt != cur_state
                 min_d = cur_state == 0 ? min_dur_s : min_dur_b
                 if cur_dur < min_d
-                    // Durasi terlalu singkat — tahan di state saat ini
                     array.set(vpath, t, cur_state)
                 else
                     cur_state := nxt
@@ -457,7 +481,6 @@ if barstate.islast
 
         VR := array.get(vpath, T-1)
 
-        // Hitung durasi current regime dari path
         dur_count = 0
         for dv = T-1 to 0
             if array.get(vpath, dv) == VR
@@ -518,7 +541,6 @@ if barstate.islast
         VC := array.get(VP, VR)
 
 // ─── INSTANTANEOUS REGIME (log-space, multivariate) ──────────────────────────
-// log P(state s | x_t) propto log mvg(x_t|s) + log pi_s
 lp0 = log_mvg(z_ret, z_atr, z_slope, 0) + math.log(math.max(array.get(HP,0), 1e-10))
 lp1 = log_mvg(z_ret, z_atr, z_slope, 1) + math.log(math.max(array.get(HP,1), 1e-10))
 lp2 = log_mvg(z_ret, z_atr, z_slope, 2) + math.log(math.max(array.get(HP,2), 1e-10))
@@ -558,12 +580,10 @@ var table TEMT = table.new(gpos(emt_ps), 8, 6, bgcolor=CK, border_width=2, borde
 
 // ─── TABLE POPULATION ────────────────────────────────────────────────────────
 if barstate.islast
-    // Expected duration per state: E[d] = 1/(1 - A_ss) (geometric)
     exp_d0 = array.get(HA,0) < 1.0 ? 1.0 / (1.0 - array.get(HA,0)) : 99.0
     exp_d1 = array.get(HA,4) < 1.0 ? 1.0 / (1.0 - array.get(HA,4)) : 99.0
     exp_d2 = array.get(HA,8) < 1.0 ? 1.0 / (1.0 - array.get(HA,8)) : 99.0
 
-    // Stationary via A^n
     MS   = array.copy(HA)
     for _si = 0 to stat_pow - 1
         MS := mm3(MS, HA)
@@ -595,7 +615,7 @@ if barstate.islast
              text_size=sh, text_halign=text.align_center)
         table.cell(TBAN, 0, 4,
              "ATR=" + fmtf(atr_sl) + "  |  win=" + str.tostring(hmm_win) +
-             "b  |  BW=" + str.tostring(bw_n) + "it  |  D=3",
+             "b  |  BW=" + str.tostring(bw_n) + "it  |  D=3  |  reg=" + str.tostring(reg_str,"#.##"),
              text_color=CFT, bgcolor=color.new(color.black,70),
              text_size=sh, text_halign=text.align_center)
 
@@ -705,7 +725,6 @@ if barstate.islast
             table.cell(TEMT, 7, s5+1, fmtd(exp_dv) + (isCur5 ? "/" + str.tostring(VDUR) + "b" : ""),
                  text_color=isCur5 ? CDT : COF, bgcolor=rowBg5, text_size=sh, text_halign=text.align_center)
 
-        // Footer: Z saat ini
         table.cell(TEMT, 0, 4, "Z current",
              text_color=CFT, bgcolor=CK, text_size=sh)
         table.cell(TEMT, 1, 4, zr_str,
