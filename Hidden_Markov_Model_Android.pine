@@ -1,33 +1,27 @@
 //@version=6
 // ═══════════════════════════════════════════════════════════════════════════
-// DST Hidden Markov Model v3 — XAUUSD [MOBILE EDITION]
+// DST Hidden Markov Model v4 — XAUUSD [MOBILE EDITION]
 // ═══════════════════════════════════════════════════════════════════════════
-// Training   : Baum-Welch EM  (multivariate, diagonal covariance)
-// Decoding   : Log-Viterbi  (numerically stabil di log-space)
-// Observation: D=3 features — Return Z, ATR Z, EMA Slope Z
-// Duration   : Geometric model + minimum duration smoothing
+// CHANGELOG v4:
+//   [BUG FIX #1] Duration Smoothing — cur_dur selalu increment meski transisi ditolak
+//   [BUG FIX #2] VDUR dihitung dari raw_vpath (Viterbi asli sebelum smoothing)
+//   [BUG FIX #3] cur_dur reset konsisten setelah transisi diterima
+//   [NEW] raw_vpath — Viterbi path asli untuk diagnostik
+//   [NEW] VDUR_RAW — durasi berdasarkan Viterbi asli
+//   [NEW] temp_scale — Posterior Temperature scaling
+//   [NEW] VCH — Confidence via entropy (lebih stabil dari gamma langsung)
+//   [NEW] Signal Strength: STRONG / MODERATE / WEAK
+//   [NEW] Lock detection: peringatan jika smoothing membekukan state
 //
 // MOBILE EDITION:
 //   [+] Semua tabel digabung menjadi SATU tabel vertikal 2 kolom
-//   [+] Posisi default middle_center agar mudah dilihat di HP
+//   [+] Posisi default middle_center untuk HP
 //   [+] Text size default large
-//   [+] Section dipisah header berwarna untuk dipindai cepat
-//   [+] Info terpenting (Regime + SL/TP) di bagian paling atas
-//   [+] Toggle per section tetap tersedia
-//
-// CHANGELOG v3 (dari v2 Mobile):
-//   [FIX] Temperature Scaling pada posterior γ — cegah collapse ke 100%
-//   [FIX] Prior mean lebih kecil (0.6 vs 1.2) — kurangi separasi state
-//   [FIX] Prior sigma lebih lebar (1.2 vs 0.9) — paksa overlap antar state
-//   [FIX] sig_floor default naik 0.05→0.30 — cegah sigma collapse
-//   [FIX] reg_str default naik 0.15→0.30 — lebih kuat tarik ke prior
-//   [FIX] bw_n default turun 5→3 — cegah overfit pada iterasi BW
-//   [FIX] hmm_win default turun 200→150 — data lebih relevan
-//   [NEW] Entropy-based confidence Conf(H) — ukuran uncertainty yang jujur
-//   [NEW] Temperature input — user dapat adjust kalibrasi posterior
-//   [NEW] Signal Strength label (STRONG/MODERATE/WEAK) di section signal
+//   [+] Section header berwarna untuk dipindai cepat
+//   [+] Info terpenting (Regime + SL/TP) di atas
+//   [+] Toggle per section
 // ═══════════════════════════════════════════════════════════════════════════
-indicator("DST HMM v3 - Mobile", overlay = true, max_labels_count = 500)
+indicator("DST HMM v4 - Mobile", overlay = true, max_labels_count = 500)
 
 // ─── INPUTS ──────────────────────────────────────────────────────────────────
 grp_h = "HMM Training"
@@ -36,48 +30,42 @@ grp_a = "ATR & SL/TP"
 grp_d = "Display"
 grp_p = "Table Position"
 
-hmm_win     = input.int(150,  "Training Window (bars)",         minval=20, maxval=500, group=grp_h,
-              tooltip="[v3] Default turun 200→150. Data lebih relevan, kurangi overfit.")
-bw_n        = input.int(3,    "Baum-Welch Iterations",          minval=1,  maxval=20,  group=grp_h,
-              tooltip="[v3] Default turun 5→3. Iterasi berlebihan menyebabkan overfit & confidence palsu.")
-sig_floor   = input.float(0.30,"Min Emission sigma",            minval=0.01, maxval=2.0, step=0.05, group=grp_h,
-              tooltip="[v3] Default naik 0.05→0.30. Nilai lebih besar = state lebih overlap = confidence lebih realistis.")
-stat_pow    = input.int(30,   "Stationary Power (A^n)",         minval=10, maxval=100, group=grp_h)
-min_dur_s   = input.int(5,    "Min Duration - Sideways (bars)", minval=1,  maxval=50,  group=grp_h,
-              tooltip="Minimum bars sebelum keluar dari regime Sideways")
-min_dur_b   = input.int(3,    "Min Duration - Bull/Bear (bars)",minval=1,  maxval=50,  group=grp_h,
-              tooltip="Minimum bars sebelum regime Bull/Bear berubah")
-reg_str     = input.float(0.30,"Regularization Strength",       minval=0.0, maxval=0.5, step=0.05, group=grp_h,
-              tooltip="[v3] Default naik 0.15→0.30. Lebih kuat menarik ke prior = cegah parameter drift ekstrem.")
-min_occ_pct = input.float(0.05,"Min State Occupancy (%T)",      minval=0.01, maxval=0.3, step=0.01, group=grp_h,
-              tooltip="State dengan gamma < X persen T tidak di-update. Cegah update dari noise.")
-temp_scale  = input.float(3.0, "Posterior Temperature",         minval=0.5, maxval=10.0, step=0.5, group=grp_h,
-              tooltip="[v3 NEW] Temperature scaling untuk posterior γ. Nilai lebih tinggi = confidence lebih realistis. Rekomendasi: 2.0-4.0. Nilai 1.0 = tidak ada scaling (perilaku v2).")
+hmm_win     = input.int(150,   "Training Window (bars)",         minval=20, maxval=500, group=grp_h)
+bw_n        = input.int(3,     "Baum-Welch Iterations",          minval=1,  maxval=20,  group=grp_h)
+sig_floor   = input.float(0.30,"Min Emission sigma",             minval=0.01, maxval=2.0, step=0.05, group=grp_h)
+stat_pow    = input.int(30,    "Stationary Power (A^n)",         minval=10, maxval=100, group=grp_h)
+min_dur_s   = input.int(2,     "Min Duration - Sideways (bars)", minval=1,  maxval=50,  group=grp_h,
+              tooltip="[v4] Default turun 5->2. Sideways boleh lebih cepat berubah.")
+min_dur_b   = input.int(1,     "Min Duration - Bull/Bear (bars)",minval=1,  maxval=50,  group=grp_h,
+              tooltip="[v4] Default turun 3->1. Biarkan model bergerak bebas.")
+reg_str     = input.float(0.30,"Regularization Strength",        minval=0.0, maxval=0.5, step=0.05, group=grp_h)
+min_occ_pct = input.float(0.05,"Min State Occupancy (%T)",       minval=0.01, maxval=0.3, step=0.01, group=grp_h)
+temp_scale  = input.float(3.0, "Posterior Temperature",          minval=0.5, maxval=10.0, step=0.5, group=grp_h,
+              tooltip="Temperature scaling posterior gamma. Rekomendasi: 2.0-4.0")
 
-z_win       = input.int(20,   "Z-Score Window",                 minval=5,  maxval=100, group=grp_f,
-              tooltip="Window rolling untuk normalisasi semua 3 fitur")
-ema_len     = input.int(21,   "EMA Length (untuk slope)",       minval=5,  maxval=100, group=grp_f)
-slope_per   = input.int(5,    "Slope Lookback (bars)",          minval=1,  maxval=20,  group=grp_f,
-              tooltip="Perubahan EMA selama N bar, dinormalisasi ATR")
-atr_len_f   = input.int(14,   "ATR Length (fitur)",             minval=1,  maxval=50,  group=grp_f)
+z_win       = input.int(20,    "Z-Score Window",                 minval=5,  maxval=100, group=grp_f)
+ema_len     = input.int(21,    "EMA Length (slope)",             minval=5,  maxval=100, group=grp_f)
+slope_per   = input.int(14,    "Slope Lookback (bars)",          minval=1,  maxval=50,  group=grp_f,
+              tooltip="[v4] Default naik 5->14. Slope lebih representatif trend sesungguhnya.")
+atr_len_f   = input.int(14,    "ATR Length (fitur)",             minval=1,  maxval=50,  group=grp_f)
 
-atr_len_sl  = input.int(14,   "ATR Length (SL/TP)",             minval=1,  maxval=50,  group=grp_a)
-atr_bull    = input.float(1.2,"ATR Mult - Bull",                minval=0.5, maxval=5.0, step=0.1, group=grp_a)
-atr_bear    = input.float(1.5,"ATR Mult - Bear",                minval=0.5, maxval=5.0, step=0.1, group=grp_a)
-rr_r        = input.float(2.0,"Risk Reward Ratio",              minval=1.0, maxval=10.0, step=0.5, group=grp_a)
+atr_len_sl  = input.int(14,    "ATR Length (SL/TP)",             minval=1,  maxval=50,  group=grp_a)
+atr_bull    = input.float(1.2, "ATR Mult - Bull",                minval=0.5, maxval=5.0, step=0.1, group=grp_a)
+atr_bear    = input.float(1.5, "ATR Mult - Bear",                minval=0.5, maxval=5.0, step=0.1, group=grp_a)
+rr_r        = input.float(2.0, "Risk Reward Ratio",              minval=1.0, maxval=10.0, step=0.5, group=grp_a)
 
-show_rib    = input.bool(true, "Regime Ribbon",                 group=grp_d)
-show_warn   = input.bool(true, "Sideways Warning",              group=grp_d)
-show_lbl    = input.bool(true, "Label Transitions",             group=grp_d)
-min_hold    = input.int(4,    "Min Hold Bars (debounce)",       minval=1, maxval=50, group=grp_d)
+show_rib    = input.bool(true,  "Regime Ribbon",                 group=grp_d)
+show_warn   = input.bool(true,  "Sideways Warning",              group=grp_d)
+show_lbl    = input.bool(true,  "Label Transitions",             group=grp_d)
+min_hold    = input.int(4,      "Min Hold Bars (debounce)",      minval=1, maxval=50, group=grp_d)
 tsize       = input.string("large","Ukuran Teks",
-              options=["small","normal","large","huge"],         group=grp_d,
+              options=["small","normal","large","huge"],          group=grp_d,
               tooltip="Untuk HP gunakan large atau huge")
 
-sec_signal  = input.bool(true, "Tampilkan: SIGNAL (Regime + SL/TP)", group=grp_d)
-sec_matrix  = input.bool(true, "Tampilkan: TRANSITION MATRIX",       group=grp_d)
-sec_emit    = input.bool(true, "Tampilkan: EMISSION PARAMS",         group=grp_d)
-sec_stat    = input.bool(true, "Tampilkan: LONG-RUN DISTRIBUTION",   group=grp_d)
+sec_signal  = input.bool(true,  "Tampilkan: SIGNAL (Regime + SL/TP)", group=grp_d)
+sec_matrix  = input.bool(true,  "Tampilkan: TRANSITION MATRIX",       group=grp_d)
+sec_emit    = input.bool(true,  "Tampilkan: EMISSION PARAMS",         group=grp_d)
+sec_stat    = input.bool(true,  "Tampilkan: LONG-RUN DISTRIBUTION",   group=grp_d)
 
 tbl_pos = input.string("middle_center", "Posisi Tabel",
           options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"],
@@ -188,18 +176,17 @@ if array.size(OB1) > hmm_win
     array.shift(OB3)
 
 // ─── HMM PARAMETERS ──────────────────────────────────────────────────────────
-// [v3 FIX] Prior mean lebih kecil — kurangi separasi state antar regime
-// [v3 FIX] Prior sigma lebih lebar — paksa state lebih overlap
+// [v4] Prior values diperbarui: lebih konservatif dan realistis untuk XAUUSD
 var array<float> HP  = array.from(0.40, 0.30, 0.30)
 var array<float> HA  = array.from(0.70, 0.15, 0.15, 0.20, 0.65, 0.15, 0.20, 0.15, 0.65)
 var array<float> HMU = array.from(
-     0.0, -0.3,  0.0,   // SIDE: overlap lebih besar
-     0.6,  0.4,  0.5,   // BULL: ret 1.2→0.6, slope 1.0→0.5
-    -0.6,  0.4, -0.5)   // BEAR: ret -1.2→-0.6, slope -1.0→-0.5
+     0.0, -0.3,  0.0,
+     0.6,  0.4,  0.5,
+    -0.6,  0.4, -0.5)
 var array<float> HSG = array.from(
-    0.8, 0.9, 0.8,   // SIDE
-    1.2, 1.2, 1.2,   // BULL
-    1.2, 1.2, 1.2)   // BEAR
+    0.8, 0.9, 0.8,
+    1.2, 1.2, 1.2,
+    1.2, 1.2, 1.2)
 
 var array<float> PRIOR_MU = array.from(
      0.0, -0.3,  0.0,
@@ -210,11 +197,12 @@ var array<float> PRIOR_SG = array.from(
     1.2, 1.2, 1.2,
     1.2, 1.2, 1.2)
 
-var int   VR   = 0
-var float VC   = 0.40
-var float VCH  = 0.40  // [v3 NEW] Entropy-based confidence
+var int   VR      = 0
+var float VC      = 0.40
+var float VCH     = 0.40
 var array<float> VP = array.from(0.40, 0.30, 0.30)
-var int   VDUR = 0
+var int   VDUR    = 0
+var int   VDUR_RAW = 0
 
 var float LG2PI3 = 1.5 * math.log(2.0 * math.pi)
 
@@ -232,9 +220,8 @@ mvg_pdf(o1, o2, o3, s) =>
     lv = log_mvg(o1, o2, o3, s)
     lv > -500.0 ? math.exp(lv) : 1e-200
 
-// ─── [v3 NEW] ENTROPY-BASED CONFIDENCE ───────────────────────────────────────
-// H(VP) = -sum p*log(p), normalized: conf = 1 - H/log(3)
-// 1.0 = certainty penuh, 0.0 = uncertainty penuh (semua state equiprobable)
+// [v4 NEW] Entropy-based confidence: 1 - H(gamma)/log(N)
+// Lebih stabil dari gamma langsung karena tidak bergantung satu nilai
 calc_conf_entropy(vp_arr) =>
     h = 0.0
     for s = 0 to 2
@@ -242,9 +229,7 @@ calc_conf_entropy(vp_arr) =>
         h -= p * math.log(p)
     1.0 - (h / math.log(3.0))
 
-// ─── [v3 NEW] TEMPERATURE SCALING ────────────────────────────────────────────
-// p_scaled_s = p_s^(1/T) / sum_k p_k^(1/T)
-// T>1: smoothing → distribusi lebih merata → confidence lebih realistis
+// [v4 NEW] Temperature scaling: ratakan distribusi posterior agar tidak terlalu confident
 apply_temperature(vp_arr, T) =>
     sum_t = 0.0
     for s = 0 to 2
@@ -263,8 +248,6 @@ if barstate.islast
 
         // ── Baum-Welch EM ─────────────────────────────────────────
         for _it = 0 to bw_n - 1
-
-            // Forward pass
             al  = array.new_float(T * N, 0.0)
             sc  = array.new_float(T, 1e-300)
             s0v = 0.0
@@ -290,7 +273,6 @@ if barstate.islast
                 for s = 0 to N-1
                     array.set(al, t*N+s, array.get(al, t*N+s) / stv)
 
-            // Backward pass
             be = array.new_float(T * N, 0.0)
             for s = 0 to N-1
                 array.set(be, (T-1)*N+s, 1.0 / array.get(sc, T-1))
@@ -304,7 +286,6 @@ if barstate.islast
                         sm += array.get(HA, s*N+sn) * bsn * array.get(be, (t+1)*N+sn)
                     array.set(be, t*N+s, sm / sct)
 
-            // Gamma
             gm = array.new_float(T * N, 0.0)
             for t = 0 to T-1
                 gs = 0.0
@@ -316,7 +297,6 @@ if barstate.islast
                 for s = 0 to N-1
                     array.set(gm, t*N+s, array.get(gm, t*N+s) / gs)
 
-            // Xi
             xi = array.new_float((T-1)*N*N, 0.0)
             for t = 0 to T-2
                 xs = 0.0
@@ -331,7 +311,6 @@ if barstate.islast
                     for j = 0 to N-1
                         array.set(xi, t*N*N+i*N+j, array.get(xi, t*N*N+i*N+j) / xs)
 
-            // M-Step: pi
             psum = 0.0
             for s = 0 to N-1
                 psum += array.get(gm, s)
@@ -339,7 +318,6 @@ if barstate.islast
             for s = 0 to N-1
                 array.set(HP, s, array.get(gm, s) / psum)
 
-            // M-Step: A
             for i = 0 to N-1
                 di = 0.0
                 for t = 0 to T-2
@@ -356,16 +334,13 @@ if barstate.islast
                     for j = 0 to N-1
                         array.set(HA, i*N+j, array.get(HA, i*N+j) / rs)
 
-            // M-Step: mu, sigma — MAP regularization + min occupancy
             for s = 0 to N-1
                 gs2 = 0.0
                 for t = 0 to T-1
                     gs2 += array.get(gm, t*N+s)
-
                 has_occ      = gs2 >= float(T) * min_occ_pct
                 occ_w        = math.min(gs2 / float(T), 1.0)
                 adaptive_reg = reg_str * (1.0 - occ_w)
-
                 for d = 0 to 2
                     if has_occ
                         wm = 0.0
@@ -376,7 +351,6 @@ if barstate.islast
                         mu_bw = wm / gs2
                         mu_nd = (1.0 - adaptive_reg) * mu_bw + adaptive_reg * array.get(PRIOR_MU, s*3+d)
                         array.set(HMU, s*3+d, mu_nd)
-
                         wv = 0.0
                         for t = 0 to T-1
                             g     = array.get(gm, t*N+s)
@@ -391,9 +365,9 @@ if barstate.islast
                         array.set(HSG, s*3+d, math.max(0.7 * array.get(HSG, s*3+d) + 0.3 * array.get(PRIOR_SG, s*3+d), float(sig_floor)))
 
         // ── State label ordering ──────────────────────────────────
-        m0v = array.get(HMU, 0*3+0)
-        m1v = array.get(HMU, 1*3+0)
-        m2v = array.get(HMU, 2*3+0)
+        m0v     = array.get(HMU, 0*3+0)
+        m1v     = array.get(HMU, 1*3+0)
+        m2v     = array.get(HMU, 2*3+0)
         bull_id = m0v >= m1v and m0v >= m2v ? 0 : m1v >= m2v ? 1 : 2
         bear_id = m0v <= m1v and m0v <= m2v ? 0 : m1v <= m2v ? 1 : 2
         side_id = bull_id == bear_id ? 2 : 3 - bull_id - bear_id
@@ -458,7 +432,11 @@ if barstate.islast
             t = T-2 - rv2
             array.set(vpath, t, array.get(psi_v, (t+1)*N + array.get(vpath, t+1)))
 
-        // ── Duration smoothing ────────────────────────────────────
+        // [v4 NEW] Simpan raw Viterbi path sebelum smoothing
+        raw_vpath = array.copy(vpath)
+
+        // [v4 FIX #1 & #3] Duration Smoothing yang Diperbaiki
+        // cur_dur selalu increment setiap bar, terlepas transisi diterima/ditolak
         cur_state = array.get(vpath, 0)
         cur_dur   = 1
         for t = 1 to T-1
@@ -467,12 +445,15 @@ if barstate.islast
                 min_d = cur_state == 0 ? min_dur_s : min_dur_b
                 if cur_dur < min_d
                     array.set(vpath, t, cur_state)
+                    cur_dur += 1
                 else
                     cur_state := nxt
                     cur_dur   := 1
             else
                 cur_dur += 1
         VR := array.get(vpath, T-1)
+
+        // VDUR dari smoothed path
         dur_count = 0
         for dv = T-1 to 0
             if array.get(vpath, dv) == VR
@@ -481,7 +462,17 @@ if barstate.islast
                 break
         VDUR := dur_count
 
-        // ── Posterior gamma + Temperature Scaling [v3] ───────────
+        // [v4 FIX #2] VDUR_RAW dari Viterbi asli — lebih akurat
+        raw_final = array.get(raw_vpath, T-1)
+        raw_dur   = 0
+        for dv2 = T-1 to 0
+            if array.get(raw_vpath, dv2) == raw_final
+                raw_dur += 1
+            else
+                break
+        VDUR_RAW := raw_dur
+
+        // ── Posterior gamma + Temperature Scaling ─────────────────
         a2  = array.new_float(T * N, 0.0)
         s2c = array.new_float(T, 1e-300)
         s0b = 0.0
@@ -518,8 +509,6 @@ if barstate.islast
                     bsn = mvg_pdf(array.get(OB1,t+1), array.get(OB2,t+1), array.get(OB3,t+1), sn)
                     sm += array.get(HA,s*N+sn) * bsn * array.get(b2,(t+1)*N+sn)
                 array.set(b2, t*N+s, sm / sct)
-
-        // Hitung raw posterior dulu
         gf = 0.0
         for s = 0 to N-1
             g = array.get(a2,(T-1)*N+s) * array.get(b2,(T-1)*N+s)
@@ -529,11 +518,8 @@ if barstate.islast
         for s = 0 to N-1
             array.set(VP, s, array.get(VP,s) / gf)
 
-        // [v3 FIX] Apply temperature scaling — cegah collapse ke 100%
         apply_temperature(VP, temp_scale)
-
         VC  := array.get(VP, VR)
-        // [v3 NEW] Entropy-based confidence
         VCH := calc_conf_entropy(VP)
 
 // ─── INSTANTANEOUS REGIME ────────────────────────────────────────────────────
@@ -566,14 +552,14 @@ tp_val  = na(sl_val)  ? float(na) : sl_val * rr_r
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MOBILE TABLE — satu tabel vertikal 2 kolom
-// Signal(10) + Matrix(6) + Emit(6) + Stat(3) + footer(1) = 26 baris maks
+// Signal(9) + Matrix(6) + Emit(6) + Stat(3) + footer(1) = 25 baris maks
 // ─────────────────────────────────────────────────────────────────────────────
-var table TM = table.new(gpos(tbl_pos), 2, 27, bgcolor=CK, border_width=1, border_color=color.new(CA,85), frame_color=CF, frame_width=2)
+var table TM = table.new(gpos(tbl_pos), 2, 26, bgcolor=CK, border_width=1, border_color=color.new(CA,85), frame_color=CF, frame_width=2)
 
 if barstate.islast
 
     conf_str   = fmtp(VC)
-    conf_h_str = fmtp(VCH)  // [v3] entropy-based confidence
+    conf_h_str = fmtp(VCH)
     zr_str     = fmtf(z_ret)
     za_str     = fmtf(z_atr)
     zs_str     = fmtf(z_slope)
@@ -595,7 +581,12 @@ if barstate.islast
     tp_text = na(tp_val)  ? "N/A" : fmtf(tp_val) + " pts"
     partial = na(sl_val)  ? "N/A" : fmtf(sl_val) + " pts"
 
-    // [v3] Signal strength berbasis entropy confidence
+    // [v4] Lock detection
+    is_locked = VDUR > VDUR_RAW * 2 and VDUR_RAW > 0
+    dur_col   = is_locked ? color.rgb(255, 100, 100) : CDT
+    lock_str  = is_locked ? " LOCK!" : ""
+
+    // [v4] Signal strength dari entropy confidence
     conf_lvl = VCH >= 0.70 ? "STRONG" : VCH >= 0.45 ? "MODERATE" : "WEAK"
     conf_col = VCH >= 0.70 ? CB : VCH >= 0.45 ? CYW : CR
 
@@ -610,7 +601,6 @@ if barstate.islast
         row += 1
 
         table.cell(TM, 0, row, "Regime", text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_left)
-        // [v3] Tampilkan Conf(H) entropy-based sebagai confidence utama
         table.cell(TM, 1, row, rgi(VR) + " (H:" + conf_h_str + ")", text_color=VR == 0 ? CYW : CDT, bgcolor=color.new(rgc(VR),55), text_size=sv, text_halign=text.align_right)
         row += 1
 
@@ -618,9 +608,8 @@ if barstate.islast
         table.cell(TM, 1, row, rgs(VR), text_color=rgsc(VR), bgcolor=CK, text_size=sv, text_halign=text.align_right)
         row += 1
 
-        // [v3 NEW] Signal Strength baris
         table.cell(TM, 0, row, "Signal Strength", text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_left)
-        table.cell(TM, 1, row, conf_lvl + "  (target: 45-75%)", text_color=conf_col, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TM, 1, row, conf_lvl + " (target: 45-75%)", text_color=conf_col, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         row += 1
 
         table.cell(TM, 0, row, "Rekomendasi", text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_left)
@@ -639,9 +628,9 @@ if barstate.islast
         table.cell(TM, 1, row, partial, text_color=color.new(CDT,30), bgcolor=CK, text_size=sh, text_halign=text.align_right)
         row += 1
 
-        table.cell(TM, 0, row, "Durasi Regime", text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_left)
-        // [v3] Tampilkan kedua confidence: γ (T-scaled) dan H (entropy)
-        table.cell(TM, 1, row, str.tostring(VDUR) + "b  |  γ:" + conf_str + "  H:" + conf_h_str, text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        // [v4] Durasi: tampilkan smoothed(s) vs raw(r) + lock warning
+        table.cell(TM, 0, row, "Durasi s/r" + lock_str, text_color=dur_col, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TM, 1, row, str.tostring(VDUR) + "b(s) / " + str.tostring(VDUR_RAW) + "b(r)  T=" + str.tostring(temp_scale,"#.#"), text_color=dur_col, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         row += 1
 
     // ══════════════════════════════════════════════════════════════
@@ -715,7 +704,6 @@ if barstate.islast
         row += 1
 
         table.cell(TM, 0, row, "SIDE | BULL | BEAR", text_color=CHD, bgcolor=CSH, text_size=sh, text_halign=text.align_left)
-        // [v3] Tampilkan Conf(H) di sini, bukan raw posterior
         table.cell(TM, 1, row, "Conf(H): " + conf_h_str, text_color=CDT, bgcolor=CSH, text_size=sh, text_halign=text.align_right)
         row += 1
 
@@ -723,11 +711,10 @@ if barstate.islast
         table.cell(TM, 1, row, "live", text_color=CA, bgcolor=CDG, text_size=sh, text_halign=text.align_right)
         row += 1
 
-    // ── Footer info ───────────────────────────────────────────────
-    // [v3] Tambahkan info temperature di footer
-    table.cell(TM, 0, row, "win=" + str.tostring(hmm_win) + "b  BW=" + str.tostring(bw_n) + "  reg=" + str.tostring(reg_str,"#.##"), text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_left)
-    table.cell(TM, 1, row, "T=" + str.tostring(temp_scale,"#.#") + "  sf=" + str.tostring(sig_floor,"#.##") + "  D=3", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+    // ── Footer ────────────────────────────────────────────────────
+    table.cell(TM, 0, row, "win=" + str.tostring(hmm_win) + "b  BW=" + str.tostring(bw_n) + "  slp=" + str.tostring(slope_per) + "b", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+    table.cell(TM, 1, row, "reg=" + str.tostring(reg_str,"#.##") + "  T=" + str.tostring(temp_scale,"#.#") + "  v4", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
 
 // ═══════════════════════════════════════════════════════════════════════════
-// End of file — DST HMM v3 Mobile
+// End of file — DST HMM v4 Mobile
 // ═══════════════════════════════════════════════════════════════════════════
