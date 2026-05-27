@@ -434,13 +434,16 @@ conf_fired   = VCH < conf_collapse_thr and VCH > 0.0
 adaptive_any = vol_shock_fired or flip_fired or conf_fired
 
 // ─── DECIDE WHETHER TO RETRAIN ───────────────────────────────────────────────
-BARS_SINCE_RETRAIN += 1
-if COOLDOWN_LEFT > 0
-    COOLDOWN_LEFT -= 1
-
 DID_RETRAIN_NOW    := false
 ADAPTIVE_TRIGGERED := false
-should_retrain      = BARS_SINCE_RETRAIN >= retrain_interval
+
+// ✅ FIX: Increment di setiap bar confirmed (bukan hanya saat display)
+if barstate.isconfirmed
+    BARS_SINCE_RETRAIN += 1
+    if COOLDOWN_LEFT > 0
+        COOLDOWN_LEFT -= 1
+
+should_retrain = BARS_SINCE_RETRAIN >= retrain_interval
 
 if use_adaptive and COOLDOWN_LEFT == 0 and adaptive_any
     should_retrain     := true
@@ -912,7 +915,7 @@ if barstate.islast
 
     retrain_mode = ADAPTIVE_TRIGGERED ? "ADAPTIVE" : "SCHEDULED"
     retrain_col  = ADAPTIVE_TRIGGERED ? color.rgb(255, 120, 50) : CDT
-    bars_left    = math.max(retrain_interval - BARS_SINCE_RETRAIN, 0)
+    bars_left = math.max(retrain_interval - BARS_SINCE_RETRAIN, 0)
     retrain_line = "Retrain #" + str.tostring(TOTAL_RETRAINS) + " (" + str.tostring(ADAPTIVE_RETRAINS) + " adp)  |  next: " + str.tostring(bars_left) + "b  |  cooldown: " + str.tostring(COOLDOWN_LEFT) + "b"
     trigger_line = retrain_mode + "  |  vol:" + str.tostring(VOL_SHOCK_COUNT) + "/" + str.tostring(vol_shock_bars) + "  flip:" + str.tostring(flip_count) + "/" + str.tostring(flip_limit) + "  conf:" + fmtp(VCH)
 
