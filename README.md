@@ -1,67 +1,10 @@
----
+- VCH ≥ 0.6 → STRONG
+- VCH < 0.35 → WEAK
+- sisanya MODERATE
 
-```markdown
-# DST Hidden Markov Model v7 — XAUUSD (Adaptive SL/TP)
-
-**Indikator Trading untuk TradingView (Pine Script v6)**  
-Menggunakan **Hidden Markov Model (HMM)** untuk mendeteksi regime pasar (Sideways, Bull, Bear, Volatile Bull, Volatile Bear) secara real-time, dilengkapi dengan **Adaptive Stop Loss (SL) & Take Profit (TP)** berbasis Confidence Entropy (`VCH`).
-
-![Contoh Tampilan](https://via.placeholder.com/800x400?text=HMM+v7+Example)
-
----
-
-## 📌 Fitur Utama
-
-- ✅ **N-state HMM** (2–5 state, default 3: Side/Bull/Bear)
-- ✅ **Observasi 4 dimensi** (return, ATR, slope, volume) — semuanya di-Z-score
-- ✅ **Baum-Welch EM** untuk training ulang periodik & adaptif
-- ✅ **Log-Viterbi** + **Duration Fix** (minimum durasi per state)
-- ✅ **Confidence Entropy (VCH)** → mengukur keyakinan model (STRONG/MODERATE/WEAK)
-- ✅ **Adaptive SL/TP** berbasis VCH:
-  - STRONG → SL lebih ketat, TP lebih jauh
-  - WEAK → SL lebih lebar, TP lebih dekat (proteksi modal)
-- ✅ **Tabel informatif**: Adaptive SL/TP, Transition Matrix, Emission, Stationary Distribution
-- ✅ **Plot garis SL/TP** di chart utama
-- ✅ **Adaptive Retraining Trigger** (vol shock, regime flip, confidence collapse)
-
----
-
-## 🧠 Cara Kerja Singkat
-
-### 1. Feature Engineering (D=4)
-Setiap bar, dihitung 4 fitur yang dinormalisasi (Z-score):
-- `z_ret`  → log return (close)
-- `z_atr`  → ATR normalized
-- `z_slope`→ kemiringan EMA (dinormalisasi dengan ATR)
-- `z_vol`  → log volume
-
-### 2. Hidden Markov Model
-- **State** : Sideways (0), Bull (1), Bear (2), VBULL (3), VBEAR (4)
-- **Emission** : Multivariate Gaussian (4 dimensi)
-- **Transition** : Matrix ukuran N×N
-- **Training** : Baum-Welch setiap interval tertentu (atau adaptif)
-
-### 3. Regime Inference
-- **Instantaneous Regime** (IR) → berdasarkan observasi terbaru
-- **Viterbi** (dengan duration fix) → menghasilkan regime akhir `VR`
-- **Posterior Forward-Backward** → probabilitas tiap state `VP`
-- **Confidence Entropy (VCH)** :
-  ```
-  VCH = 1 - (H / log(N))
-  H   = - Σ p(s) * log(p(s))
-  ```
-  - VCH ≥ 0.6 → STRONG
-  - VCH < 0.35 → WEAK
-  - sisanya MODERATE
-
-### 4. Adaptive SL/TP (NEW in v7)
-- **Base SL multiplier** berdasarkan regime (Bull/Bear/VBULL/VBEAR)
+### 4. Adaptive SL/TP
+- **Base SL multiplier** berdasarkan regime
 - **Adjustment factor** berdasarkan VCH tier
-  ```
-  SL_final   = base_sl × (tight/wide/1.0)
-  RR_final   = RR_strong / RR_moderate / RR_weak
-  TP_final   = SL_final × RR_final
-  ```
 - **Partial TP 1:1** (risk pertama)
 - **Plot garis** di chart & tabel detail
 
@@ -77,7 +20,7 @@ Model dilatih ulang lebih cepat jika:
 
 1. Buka TradingView → **Pine Editor**
 2. Buat **indicator baru**
-3. Copy-paste seluruh kode `HMM_V7.txt`
+3. Copy-paste seluruh kode `Hidden_Markov_Model.pine`
 4. Simpan dengan nama bebas (contoh: `HMM_v7_XAUUSD`)
 5. Tambahkan ke chart (symbol XAUUSD atau lainnya)
 
@@ -176,7 +119,7 @@ Menampilkan:
 | SL/TP | Konstan (per regime) | **Adaptive** berdasarkan VCH |
 | Tabel SL/TP | "DST KALKULASI" | **ADAPTIVE SL/TP** + adjustment factor |
 | Plot garis | Tidak ada | **Ada** (SL/TP/Partial) |
-| Risiko saat VCH rendah | Tetap ambil posisi | **SL lebih lebar, TP lebih dekat** (proteksi) |
+| Risiko saat VCH rendah | Tetap ambil posisi | **SL lebih lebar, TP lebih dekat** |
 
 ---
 
@@ -200,20 +143,5 @@ Jika SL/TP tidak muncul:
 - Pastikan regime bukan SIDE (0)
 - Cek `show_sltp_plot = true`
 - Periksa nilai `atr_sl` tidak nol
-
----
-
-## 📄 Lisensi
-
-MIT License — Bebas digunakan, dimodifikasi, dan didistribusikan.  
-Dikembangkan untuk komunitas trading algorithmic.
-
----
-
-## 🙏 Kredit
-
-- DST (Developer)
-- Berbasis Hidden Markov Model (Rabiner, 1989)
-- Implementasi Pine Script v7
 
 ---
