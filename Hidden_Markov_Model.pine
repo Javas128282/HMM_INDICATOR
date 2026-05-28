@@ -1,44 +1,11 @@
 //@version=6
 // ═══════════════════════════════════════════════════════════════════════════
-// DST Hidden Markov Model v7 — XAUUSD
+// DST HMM v8 — XAUUSD + Kalman Filter Integration
 // ═══════════════════════════════════════════════════════════════════════════
-// CHANGELOG v7 (dari v6):
-//
-//   [NEW] Adaptive SL/TP berbasis VCH (Confidence Entropy)
-//     SL dan TP tidak lagi konstan — multiplier ATR bergerak mengikuti
-//     keyakinan model yang diukur oleh Conf(H) = VCH.
-//
-//     Prinsip:
-//       VCH tinggi (STRONG ≥ thr_strong) → model yakin, regime bersih
-//         → SL lebih KETAT (x sl_tight_mult) → TP lebih JAUH (x rr_strong)
-//         → Risk kecil, reward besar (maximize pada sinyal bagus)
-//
-//       VCH sedang (MODERATE, thr_weak–thr_strong) → default
-//         → SL = base multiplier (atr_bull / atr_bear)
-//         → TP = RR default (rr_r)
-//
-//       VCH rendah (WEAK < thr_weak) → model ragu, regime noise
-//         → SL lebih LEBAR (x sl_wide_mult) → TP lebih DEKAT (x rr_weak)
-//         → Capital protection — jangan ambil risiko besar saat model kabur
-//
-//     Formula akhir:
-//       sl_mult_adaptive = base_sl * conf_sl_adj
-//       rr_adaptive      = rr_r * conf_rr_adj
-//       tp_adaptive      = sl_adaptive * rr_adaptive
-//
-//   [NEW] Tabel "ADAPTIVE SL/TP" menggantikan "DST KALKULASI" lama
-//     Menampilkan: VCH tier, SL/TP harga aktual (close ± SL/TP pts),
-//     partial TP 1:1, confidence adjustment factor, dan status sinyal.
-//
-//   [NEW] Plot SL/TP sebagai garis chart (opsional)
-//     sl_line dan tp_line di-plot sebagai garis warna di chart utama.
-//
-//   [RETAINED] Semua fitur v6: N-state, D=4, Retraining Interval,
-//              Adaptive Trigger, Baum-Welch EM, Log-Viterbi, Duration Fix.
-// ═══════════════════════════════════════════════════════════════════════════
-indicator("DST HMM v7 - XAUUSD (Adaptive SL/TP)", overlay = true, max_labels_count = 500)
+indicator("DST HMM v8 - XAUUSD (+ Kalman Filter)", overlay = true, max_labels_count = 500)
 
 // ─── INPUTS ──────────────────────────────────────────────────────────────────
+grp_kf  = "Kalman Filter"
 grp_h   = "HMM Training"
 grp_rt  = "Retraining Schedule"
 grp_f   = "Feature Settings"
@@ -46,69 +13,64 @@ grp_sl  = "Adaptive SL/TP"
 grp_d   = "Display"
 grp_p   = "Table Positions"
 
-// ── HMM Core ──
-n_states          = input.int(3,     "Jumlah Hidden States (N)",          minval=2,    maxval=5,    group=grp_h, tooltip="3=Side/Bull/Bear (default). 4=+VBULL. 5=+VBULL+VBEAR.")
-hmm_win           = input.int(150,   "Training Window (bars)",            minval=20,   maxval=500,  group=grp_h)
-bw_n              = input.int(3,     "Baum-Welch Iterations",             minval=1,    maxval=20,   group=grp_h)
-sig_floor         = input.float(0.30,"Min Emission sigma",                minval=0.01, maxval=2.0,  step=0.05,  group=grp_h)
-stat_pow          = input.int(30,    "Stationary Power (A^n)",            minval=10,   maxval=100,  group=grp_h)
-min_dur_s         = input.int(2,     "Min Duration - Sideways (bars)",    minval=1,    maxval=50,   group=grp_h)
-min_dur_b         = input.int(1,     "Min Duration - Bull/Bear (bars)",   minval=1,    maxval=50,   group=grp_h)
-reg_str           = input.float(0.30,"Regularization Strength",           minval=0.0,  maxval=0.5,  step=0.05,  group=grp_h)
-min_occ_pct       = input.float(0.05,"Min State Occupancy (%T)",         minval=0.01, maxval=0.3,  step=0.01,  group=grp_h)
-temp_scale        = input.float(3.0, "Posterior Temperature",             minval=0.5,  maxval=10.0, step=0.5,   group=grp_h)
+kf_q_base    = input.float(0.01,  "Process Noise Q (base)",          minval=0.0001, maxval=1.0,  step=0.001, group=grp_kf)
+kf_q_atr_mul = input.float(2.0,   "Q ATR Multiplier (adaptive Q)",   minval=0.0,   maxval=10.0, step=0.1,   group=grp_kf)
+kf_r         = input.float(1.0,   "Measurement Noise R",             minval=0.01,  maxval=10.0, step=0.01,  group=grp_kf)
+kf_band_mult = input.float(1.5,   "Confidence Band Multiplier",      minval=0.5,   maxval=5.0,  step=0.1,   group=grp_kf)
+use_kf_feat  = input.bool(true,   "Gunakan KF sebagai Fitur HMM",    group=grp_kf)
+kf_sl_base   = input.bool(true,   "SL/TP Berbasis KF Price",         group=grp_kf)
+show_kf_plot = input.bool(true,   "Plot KF Line + Band di Chart",    group=grp_kf)
+show_kf_vel  = input.bool(false,  "Plot KF Velocity (histogram)",    group=grp_kf)
 
-// ── Retraining Schedule ──
-retrain_interval  = input.int(20,    "Retraining Interval (bars)",        minval=1,    maxval=200,  group=grp_rt, tooltip="Baum-Welch hanya berjalan setiap N bar.")
+n_states          = input.int(3,     "Jumlah Hidden States (N)",          minval=2, maxval=5,    group=grp_h)
+hmm_win           = input.int(150,   "Training Window (bars)",            minval=20, maxval=500, group=grp_h)
+bw_n              = input.int(3,     "Baum-Welch Iterations",             minval=1, maxval=20,   group=grp_h)
+sig_floor         = input.float(0.30,"Min Emission sigma",                minval=0.01, maxval=2.0, step=0.05, group=grp_h)
+stat_pow          = input.int(30,    "Stationary Power (A^n)",            minval=10, maxval=100, group=grp_h)
+min_dur_s         = input.int(2,     "Min Duration - Sideways (bars)",    minval=1, maxval=50,   group=grp_h)
+min_dur_b         = input.int(1,     "Min Duration - Bull/Bear (bars)",   minval=1, maxval=50,   group=grp_h)
+reg_str           = input.float(0.30,"Regularization Strength",           minval=0.0, maxval=0.5, step=0.05, group=grp_h)
+min_occ_pct       = input.float(0.05,"Min State Occupancy (%T)",          minval=0.01, maxval=0.3, step=0.01, group=grp_h)
+temp_scale        = input.float(3.0, "Posterior Temperature",             minval=0.5, maxval=10.0, step=0.5,  group=grp_h)
+
+retrain_interval  = input.int(20,    "Retraining Interval (bars)",        minval=1, maxval=200,  group=grp_rt)
 use_adaptive      = input.bool(true, "Adaptive Retraining Trigger",       group=grp_rt)
-vol_shock_thr     = input.float(2.0, "Vol Shock Threshold (z_atr)",       minval=1.0,  maxval=5.0,  step=0.1,   group=grp_rt)
-vol_shock_bars    = input.int(3,     "Vol Shock Persistence (bars)",      minval=1,    maxval=20,   group=grp_rt)
-flip_window       = input.int(10,    "Regime Flip Window (bars)",         minval=3,    maxval=50,   group=grp_rt)
-flip_limit        = input.int(4,     "Max Regime Flips in Window",        minval=2,    maxval=20,   group=grp_rt)
-conf_collapse_thr = input.float(0.20,"Confidence Collapse Threshold",    minval=0.05, maxval=0.60, step=0.05,  group=grp_rt)
-retrain_cooldown  = input.int(5,     "Adaptive Retraining Cooldown (bars)", minval=1, maxval=50,   group=grp_rt)
+vol_shock_thr     = input.float(2.0, "Vol Shock Threshold (z_atr)",       minval=1.0, maxval=5.0, step=0.1, group=grp_rt)
+vol_shock_bars    = input.int(3,     "Vol Shock Persistence (bars)",      minval=1, maxval=20,   group=grp_rt)
+flip_window       = input.int(10,    "Regime Flip Window (bars)",         minval=3, maxval=50,   group=grp_rt)
+flip_limit        = input.int(4,     "Max Regime Flips in Window",        minval=2, maxval=20,   group=grp_rt)
+conf_collapse_thr = input.float(0.20,"Confidence Collapse Threshold",     minval=0.05, maxval=0.60, step=0.05, group=grp_rt)
+retrain_cooldown  = input.int(5,     "Adaptive Retraining Cooldown (bars)", minval=1, maxval=50, group=grp_rt)
 
-// ── Features ──
-z_win     = input.int(20,   "Z-Score Window",                minval=5,  maxval=100, group=grp_f)
-ema_len   = input.int(21,   "EMA Length (untuk slope)",      minval=5,  maxval=100, group=grp_f)
-slope_per = input.int(14,   "Slope Lookback (bars)",         minval=1,  maxval=50,  group=grp_f)
-atr_len_f = input.int(14,   "ATR Length (fitur)",            minval=1,  maxval=50,  group=grp_f)
-vol_len_f = input.int(20,   "Volume Z-Score Window (fitur)", minval=5,  maxval=100, group=grp_f)
+z_win     = input.int(20,  "Z-Score Window",               minval=5, maxval=100,  group=grp_f)
+ema_len   = input.int(21,  "EMA Length (fallback slope)",  minval=5, maxval=100,  group=grp_f)
+slope_per = input.int(14,  "Slope Lookback (fallback)",    minval=1, maxval=50,   group=grp_f)
+atr_len_f = input.int(14,  "ATR Length (fitur)",           minval=1, maxval=50,   group=grp_f)
+vol_len_f = input.int(20,  "Volume Z-Score Window",        minval=5, maxval=100,  group=grp_f)
 
-// ── [NEW v7] Adaptive SL/TP ──
-atr_len_sl   = input.int(14,    "ATR Length (SL/TP)",              minval=1,    maxval=50,   group=grp_sl)
+atr_len_sl    = input.int(14,    "ATR Length (SL/TP)",               minval=1, maxval=50, group=grp_sl)
+atr_bull_base = input.float(1.2, "Base SL Mult - Bull",             minval=0.3, maxval=5.0, step=0.1, group=grp_sl)
+atr_bear_base = input.float(1.5, "Base SL Mult - Bear",             minval=0.3, maxval=5.0, step=0.1, group=grp_sl)
+atr_vbull_base= input.float(1.8, "Base SL Mult - VBULL",            minval=0.3, maxval=5.0, step=0.1, group=grp_sl)
+atr_vbear_base= input.float(2.0, "Base SL Mult - VBEAR",            minval=0.3, maxval=5.0, step=0.1, group=grp_sl)
+vch_strong    = input.float(0.60,"VCH Threshold - STRONG",          minval=0.30, maxval=0.95, step=0.05, group=grp_sl)
+vch_weak      = input.float(0.35,"VCH Threshold - WEAK",            minval=0.05, maxval=0.50, step=0.05, group=grp_sl)
+sl_tight_pct  = input.float(0.75,"SL Adjustment - STRONG (x base)", minval=0.30, maxval=1.00, step=0.05, group=grp_sl)
+sl_wide_pct   = input.float(1.40,"SL Adjustment - WEAK (x base)",   minval=1.00, maxval=3.00, step=0.05, group=grp_sl)
+rr_strong     = input.float(3.0, "RR Ratio - STRONG",               minval=1.0, maxval=10.0, step=0.5, group=grp_sl)
+rr_moderate   = input.float(2.0, "RR Ratio - MODERATE",             minval=1.0, maxval=10.0, step=0.5, group=grp_sl)
+rr_weak       = input.float(1.0, "RR Ratio - WEAK",                 minval=0.5, maxval=5.0,  step=0.5, group=grp_sl)
+show_sltp_table = input.bool(true, "Tampilkan Tabel Adaptive SL/TP", group=grp_sl)
+show_sltp_plot  = input.bool(true, "Plot SL/TP Lines di Chart",      group=grp_sl)
 
-// Base SL multiplier per regime (dipakai saat VCH MODERATE)
-atr_bull_base = input.float(1.2, "Base SL Mult - Bull",            minval=0.3,  maxval=5.0,  step=0.1, group=grp_sl, tooltip="ATR multiplier untuk SL di kondisi BULL, dipakai saat confidence MODERATE.")
-atr_bear_base = input.float(1.5, "Base SL Mult - Bear",            minval=0.3,  maxval=5.0,  step=0.1, group=grp_sl, tooltip="ATR multiplier untuk SL di kondisi BEAR, dipakai saat confidence MODERATE.")
-atr_vbull_base= input.float(1.8, "Base SL Mult - VBULL",           minval=0.3,  maxval=5.0,  step=0.1, group=grp_sl, tooltip="ATR multiplier untuk SL di kondisi VOLATILE BULL.")
-atr_vbear_base= input.float(2.0, "Base SL Mult - VBEAR",           minval=0.3,  maxval=5.0,  step=0.1, group=grp_sl, tooltip="ATR multiplier untuk SL di kondisi VOLATILE BEAR.")
-
-// VCH tier thresholds
-vch_strong   = input.float(0.60, "VCH Threshold - STRONG",         minval=0.30, maxval=0.95, step=0.05, group=grp_sl, tooltip="VCH >= threshold ini dianggap sinyal STRONG: SL ketat, TP jauh.")
-vch_weak     = input.float(0.35, "VCH Threshold - WEAK",           minval=0.05, maxval=0.50, step=0.05, group=grp_sl, tooltip="VCH < threshold ini dianggap sinyal WEAK: SL lebar, TP dekat. Sebaiknya skip trade.")
-
-// Confidence-based SL adjustment
-sl_tight_pct = input.float(0.75, "SL Adjustment - STRONG (x base)", minval=0.30, maxval=1.00, step=0.05, group=grp_sl, tooltip="Faktor pengali SL saat VCH STRONG. < 1.0 = SL lebih ketat dari base.\nContoh: 0.75 artinya SL = 75% dari base multiplier.")
-sl_wide_pct  = input.float(1.40, "SL Adjustment - WEAK (x base)",   minval=1.00, maxval=3.00, step=0.05, group=grp_sl, tooltip="Faktor pengali SL saat VCH WEAK. > 1.0 = SL lebih lebar dari base.\nContoh: 1.4 artinya SL = 140% dari base multiplier.")
-
-// Confidence-based RR adjustment
-rr_strong    = input.float(3.0,  "RR Ratio - STRONG",               minval=1.0,  maxval=10.0, step=0.5, group=grp_sl, tooltip="Risk:Reward yang dipakai saat VCH STRONG. Lebih besar = TP lebih jauh.")
-rr_moderate  = input.float(2.0,  "RR Ratio - MODERATE",             minval=1.0,  maxval=10.0, step=0.5, group=grp_sl, tooltip="Risk:Reward default saat VCH MODERATE.")
-rr_weak      = input.float(1.0,  "RR Ratio - WEAK",                 minval=0.5,  maxval=5.0,  step=0.5, group=grp_sl, tooltip="Risk:Reward saat VCH WEAK. Lebih kecil = TP lebih dekat.")
-
-show_sltp_table = input.bool(true,  "Tampilkan Tabel Adaptive SL/TP",  group=grp_sl)
-show_sltp_plot  = input.bool(true,  "Plot SL/TP Lines di Chart",        group=grp_sl, tooltip="Plot garis SL dan TP di chart utama berdasarkan close terakhir.")
-
-// ── Display ──
-show_rib  = input.bool(true, "Regime Ribbon",    group=grp_d)
-show_warn = input.bool(true, "Sideways Warning", group=grp_d)
-show_ban  = input.bool(true, "Regime Banner",    group=grp_d)
-show_mat  = input.bool(true, "Transition Matrix",group=grp_d)
-show_stat = input.bool(true, "Stationary Dist.", group=grp_d)
-show_emit = input.bool(true, "Emission Params",  group=grp_d)
-show_lbl  = input.bool(true, "Label Transitions",group=grp_d)
-min_hold  = input.int(4,     "Min Hold Bars",    minval=1, maxval=50, group=grp_d)
+show_rib  = input.bool(true, "Regime Ribbon",     group=grp_d)
+show_warn = input.bool(true, "Sideways Warning",  group=grp_d)
+show_ban  = input.bool(true, "Regime Banner",     group=grp_d)
+show_mat  = input.bool(true, "Transition Matrix", group=grp_d)
+show_stat = input.bool(true, "Stationary Dist.",  group=grp_d)
+show_emit = input.bool(true, "Emission Params",   group=grp_d)
+show_lbl  = input.bool(true, "Label Transitions", group=grp_d)
+min_hold  = input.int(4,     "Min Hold Bars",     minval=1, maxval=50, group=grp_d)
 tsize     = input.string("normal","Table Text Size", options=["small","normal","large","huge"], group=grp_d)
 
 ban_ps = input.string("top_left",    "Banner",     options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group=grp_p)
@@ -153,39 +115,40 @@ mm_n(A_mat, B_mat, sz) =>
             array.set(C_mat, r_i*sz+c_i, s_i)
     C_mat
 
-fmtp(p) => str.tostring(math.round(p * 100)) + "%"
-fmtf(v) => str.tostring(math.round(v * 100) / 100.0, "#.##")
-fmtd(v) => str.tostring(math.round(v * 10) / 10.0, "#.#") + "b"
+fmtp(p)     => str.tostring(math.round(p * 100)) + "%"
+fmtf(v)     => str.tostring(math.round(v * 100) / 100.0, "#.##")
+fmtd(v)     => str.tostring(math.round(v * 10) / 10.0, "#.#") + "b"
 fmtprice(v) => str.tostring(math.round(v * 100) / 100.0, "#.##")
 
 sv = gsz(tsize)
 sh = gszh(tsize)
 
 // ─── PALETTE ─────────────────────────────────────────────────────────────────
-CB  = color.rgb(132, 187, 161)
-CR  = color.rgb(197, 127, 134)
-CS  = color.rgb(164, 171, 183)
-CVB = color.rgb(80,  160, 220)
-CVR = color.rgb(220, 130,  60)
-CK  = color.new(#0B0F0D, 8)
-CF  = color.new(#3FDE7E, 78)
-CA  = #3FDE7E
-CDG = color.new(#3FDE7E, 80)
-CDT = #6BF0A6
-COF = color.new(color.white, 55)
-CHD = color.new(color.white, 35)
-CFT = color.new(color.white, 60)
-CWN = color.rgb(255, 200, 0, 88)
-CWT = color.white
-// [NEW v7] Warna SL/TP plot
-CSL = color.rgb(220,  80,  80)
-CTP = color.rgb( 80, 200, 120)
-CPT = color.rgb(100, 180, 240)
+CB   = color.rgb(132, 187, 161)
+CR   = color.rgb(197, 127, 134)
+CS   = color.rgb(164, 171, 183)
+CVB  = color.rgb(80,  160, 220)
+CVR  = color.rgb(220, 130,  60)
+CK   = color.new(#0B0F0D, 8)
+CF   = color.new(#3FDE7E, 78)
+CA   = #3FDE7E
+CDG  = color.new(#3FDE7E, 80)
+CDT  = #6BF0A6
+COF  = color.new(color.white, 55)
+CHD  = color.new(color.white, 35)
+CFT  = color.new(color.white, 60)
+CWN  = color.rgb(255, 200, 0, 88)
+CWT  = color.white
+CSL  = color.rgb(220,  80,  80)
+CTP  = color.rgb( 80, 200, 120)
+CPT  = color.rgb(100, 180, 240)
+CKF  = color.rgb( 80, 180, 240)
+CKFB = color.new(color.rgb(80, 180, 240), 82)
 
-rgc(r)  => r == 1 ? CB  : r == 2 ? CR  : r == 3 ? CVB : r == 4 ? CVR : CS
-rgn(r)  => r == 1 ? "BULL" : r == 2 ? "BEAR" : r == 3 ? "VBULL" : r == 4 ? "VBEAR" : "SIDE"
-rgi(r)  => r == 1 ? "BULL" : r == 2 ? "BEAR" : r == 3 ? "VOLATILE BULL" : r == 4 ? "VOLATILE BEAR" : "SIDEWAYS"
-rgd(r)  =>
+rgc(r) => r == 1 ? CB  : r == 2 ? CR  : r == 3 ? CVB : r == 4 ? CVR : CS
+rgn(r) => r == 1 ? "BULL" : r == 2 ? "BEAR" : r == 3 ? "VBULL" : r == 4 ? "VBEAR" : "SIDE"
+rgi(r) => r == 1 ? "BULL" : r == 2 ? "BEAR" : r == 3 ? "VOLATILE BULL" : r == 4 ? "VOLATILE BEAR" : "SIDEWAYS"
+rgd(r) =>
     if r == 1
         "BULL  |  IKUTI NAIK"
     else if r == 2
@@ -196,25 +159,82 @@ rgd(r)  =>
         "VOLATILE BEAR  |  SL LEBIH LEBAR"
     else
         "SIDEWAYS — DON'T TRADE"
-rgs(r)  => r == 1 ? "BIAS BUY" : r == 2 ? "BIAS SELL" : r == 3 ? "BUY (HIGH VOL)" : r == 4 ? "SELL (HIGH VOL)" : "DON'T TRADE"
-rgsc(r) => r == 1 ? CB : r == 2 ? CR : r == 3 ? CVB : r == 4 ? CVR : color.rgb(255, 200, 0)
 
-// ─── FEATURE COMPUTATION (D=4) ───────────────────────────────────────────────
-lr      = close > 0 and close[1] > 0 ? math.log(close / close[1]) : 0.0
-lr_mu   = ta.sma(lr, z_win)
-lr_sd   = ta.stdev(lr, z_win)
-z_ret   = lr_sd > 1e-10 ? (lr - lr_mu) / lr_sd : 0.0
+// ─── KALMAN FILTER ───────────────────────────────────────────────────────────
+var float kfx0  = close
+var float kfx1  = 0.0
+var float kfp00 = 10.0
+var float kfp01 = 0.0
+var float kfp10 = 0.0
+var float kfp11 = 10.0
 
-atr_raw  = ta.atr(atr_len_f)
-atr_mu   = ta.sma(atr_raw, z_win)
-atr_sd   = ta.stdev(atr_raw, z_win)
-z_atr    = atr_sd > 1e-10 ? (atr_raw - atr_mu) / atr_sd : 0.0
+atr_raw_kf = ta.atr(atr_len_f)
+atr_mu_kf  = ta.sma(atr_raw_kf, z_win)
+atr_sd_kf  = ta.stdev(atr_raw_kf, z_win)
+z_atr_kf   = atr_sd_kf > 1e-10 ? (atr_raw_kf - atr_mu_kf) / atr_sd_kf : 0.0
+z_atr_norm = math.max(z_atr_kf, 0.0)
+kf_q_adapt = kf_q_base * (1.0 + kf_q_atr_mul * z_atr_norm)
 
-ema_val   = ta.ema(close, ema_len)
-slope_raw = atr_raw > 1e-10 ? (ema_val - ema_val[slope_per]) / (slope_per * atr_raw) : 0.0
-slope_mu  = ta.sma(slope_raw, z_win)
-slope_sd  = ta.stdev(slope_raw, z_win)
-z_slope   = slope_sd > 1e-10 ? (slope_raw - slope_mu) / slope_sd : 0.0
+kfx0_pred = kfx0 + kfx1
+kfx1_pred = kfx1
+
+kf_qp = kf_q_adapt
+kf_qv = kf_q_adapt * 0.1
+
+fp00 = kfp00 + kfp10
+fp01 = kfp01 + kfp11
+fp10 = kfp10
+fp11 = kfp11
+
+pp00 = fp00 + fp01 + kf_qp
+pp01 = fp01
+pp10 = fp10 + fp11
+pp11 = fp11 + kf_qv
+
+kf_innovation = close - kfx0_pred
+kf_S          = pp00 + kf_r
+kf_k0         = pp00 / kf_S
+kf_k1         = pp10 / kf_S
+
+kfx0 := kfx0_pred + kf_k0 * kf_innovation
+kfx1 := kfx1_pred + kf_k1 * kf_innovation
+
+kfp00 := (1.0 - kf_k0) * pp00
+kfp01 := (1.0 - kf_k0) * pp01
+kfp10 := -kf_k1 * pp00 + pp10
+kfp11 := -kf_k1 * pp01 + pp11
+
+kf_price    = kfx0
+kf_velocity = kfx1
+kf_residual = kf_innovation
+kf_variance = kfp00
+kf_band     = math.sqrt(math.max(kf_variance, 0.0)) * kf_band_mult
+kf_upper    = kf_price + kf_band
+kf_lower    = kf_price - kf_band
+
+// ─── FEATURES (D=4) ──────────────────────────────────────────────────────────
+price_for_ret = use_kf_feat ? kf_price : close
+lr    = price_for_ret > 0 and price_for_ret[1] > 0 ? math.log(price_for_ret / price_for_ret[1]) : 0.0
+lr_mu = ta.sma(lr, z_win)
+lr_sd = ta.stdev(lr, z_win)
+z_ret = lr_sd > 1e-10 ? (lr - lr_mu) / lr_sd : 0.0
+
+atr_raw = ta.atr(atr_len_f)
+atr_mu  = ta.sma(atr_raw, z_win)
+atr_sd  = ta.stdev(atr_raw, z_win)
+z_atr   = atr_sd > 1e-10 ? (atr_raw - atr_mu) / atr_sd : 0.0
+
+z_slope = float(na)
+if use_kf_feat
+    vel_mu   = ta.sma(kf_velocity, z_win)
+    vel_sd   = ta.stdev(kf_velocity, z_win)
+    z_slope := vel_sd > 1e-10 ? (kf_velocity - vel_mu) / vel_sd : 0.0
+else
+    ema_val   = ta.ema(close, ema_len)
+    slope_raw = atr_raw > 1e-10 ? (ema_val - ema_val[slope_per]) / (slope_per * atr_raw) : 0.0
+    slope_mu  = ta.sma(slope_raw, z_win)
+    slope_sd  = ta.stdev(slope_raw, z_win)
+    z_slope  := slope_sd > 1e-10 ? (slope_raw - slope_mu) / slope_sd : 0.0
 
 log_vol = volume > 0 ? math.log(volume) : 0.0
 vol_mu  = ta.sma(log_vol, vol_len_f)
@@ -237,7 +257,7 @@ if array.size(OB1) > hmm_win
     array.shift(OB3)
     array.shift(OB4)
 
-// ─── KONSTANTA DIMENSI ────────────────────────────────────────────────────────
+// ─── KONSTANTA ───────────────────────────────────────────────────────────────
 var int D_FEAT = 4
 var int N_MAX  = 5
 
@@ -247,63 +267,60 @@ var array<float> HSG_INIT = array.new_float(25, 1.0)
 var array<float> HA_INIT  = array.new_float(25, 0.0)
 
 if barstate.isfirst
-    // State 0 SIDE
+    // mu — SIDE (state 0)
     array.set(HMU_INIT,  0,  0.0)
     array.set(HMU_INIT,  1, -0.3)
     array.set(HMU_INIT,  2,  0.0)
     array.set(HMU_INIT,  3, -0.3)
-    // State 1 BULL
+    // mu — BULL (state 1)
     array.set(HMU_INIT,  5,  0.6)
     array.set(HMU_INIT,  6,  0.4)
     array.set(HMU_INIT,  7,  0.5)
     array.set(HMU_INIT,  8,  0.5)
-    // State 2 BEAR
+    // mu — BEAR (state 2)
     array.set(HMU_INIT, 10, -0.6)
     array.set(HMU_INIT, 11,  0.4)
     array.set(HMU_INIT, 12, -0.5)
     array.set(HMU_INIT, 13,  0.5)
-    // State 3 VBULL
+    // mu — VBULL (state 3)
     array.set(HMU_INIT, 15,  1.0)
     array.set(HMU_INIT, 16,  1.2)
     array.set(HMU_INIT, 17,  0.8)
     array.set(HMU_INIT, 18,  1.2)
-    // State 4 VBEAR
+    // mu — VBEAR (state 4)
     array.set(HMU_INIT, 20, -1.0)
     array.set(HMU_INIT, 21,  1.2)
     array.set(HMU_INIT, 22, -0.8)
     array.set(HMU_INIT, 23,  1.2)
-    // Sigma — SIDE
+    // sigma — SIDE
     array.set(HSG_INIT,  0, 0.8)
     array.set(HSG_INIT,  1, 0.9)
     array.set(HSG_INIT,  2, 0.8)
     array.set(HSG_INIT,  3, 0.8)
-    // Sigma — BULL
+    // sigma — BULL
     array.set(HSG_INIT,  5, 1.2)
     array.set(HSG_INIT,  6, 1.2)
     array.set(HSG_INIT,  7, 1.2)
     array.set(HSG_INIT,  8, 1.0)
-    // Sigma — BEAR
+    // sigma — BEAR
     array.set(HSG_INIT, 10, 1.2)
     array.set(HSG_INIT, 11, 1.2)
     array.set(HSG_INIT, 12, 1.2)
     array.set(HSG_INIT, 13, 1.0)
-    // Sigma — VBULL
+    // sigma — VBULL
     array.set(HSG_INIT, 15, 1.5)
     array.set(HSG_INIT, 16, 1.5)
     array.set(HSG_INIT, 17, 1.5)
     array.set(HSG_INIT, 18, 1.3)
-    // Sigma — VBEAR
+    // sigma — VBEAR
     array.set(HSG_INIT, 20, 1.5)
     array.set(HSG_INIT, 21, 1.5)
     array.set(HSG_INIT, 22, 1.5)
     array.set(HSG_INIT, 23, 1.3)
-    // Transition — diagonal dominan
+    // transition — diagonal dominan
     for i_a = 0 to N_MAX - 1
         for j_a = 0 to N_MAX - 1
-            if i_a == j_a
-                array.set(HA_INIT, i_a*N_MAX+j_a, 0.65)
-            else
-                array.set(HA_INIT, i_a*N_MAX+j_a, 0.35 / 4.0)
+            array.set(HA_INIT, i_a*N_MAX+j_a, i_a == j_a ? 0.65 : 0.35 / 4.0)
 
 var array<float> HP  = array.from(0.35, 0.25, 0.25, 0.10, 0.05)
 var array<float> HA  = array.new_float(25, 0.0)
@@ -340,28 +357,27 @@ var int  VOL_SHOCK_COUNT    = 0
 var array<int> FLIP_HISTORY = array.new_int(0)
 
 // ─── REGIME OUTPUTS ──────────────────────────────────────────────────────────
-var int   VR       = 0
-var float VC       = 0.35
-var float VCH      = 0.35
+var int   VR  = 0
+var float VC  = 0.35
+var float VCH = 0.35
 var array<float> VP = array.from(0.35, 0.25, 0.25, 0.10, 0.05)
 var int   VDUR     = 0
 var int   VDUR_RAW = 0
 
-// ─── [NEW v7] ADAPTIVE SL/TP STATE ───────────────────────────────────────────
-// Nilai-nilai ini dihitung setiap bar dari VCH + VR + ATR
-var float SL_MULT_FINAL = 0.0   // multiplier ATR untuk SL final
-var float RR_FINAL      = 0.0   // Risk:Reward final
-var float SL_PTS        = 0.0   // SL dalam poin
-var float TP_PTS        = 0.0   // TP dalam poin
-var float SL_PRICE_L    = 0.0   // Harga SL arah Long
-var float SL_PRICE_S    = 0.0   // Harga SL arah Short
-var float TP_PRICE_L    = 0.0   // Harga TP arah Long
-var float TP_PRICE_S    = 0.0   // Harga TP arah Short
-var float PT_PRICE_L    = 0.0   // Partial TP 1:1 arah Long
-var float PT_PRICE_S    = 0.0   // Partial TP 1:1 arah Short
-var string VCH_TIER     = "MODERATE"
-var float SL_ADJ_FACTOR = 1.0   // faktor penyesuaian SL dari VCH
-var float RR_ADJ        = 2.0   // RR yang dipakai
+// ─── ADAPTIVE SL/TP STATE ────────────────────────────────────────────────────
+var float  SL_MULT_FINAL = 0.0
+var float  RR_FINAL      = 0.0
+var float  SL_PTS        = 0.0
+var float  TP_PTS        = 0.0
+var float  SL_PRICE_L    = 0.0
+var float  SL_PRICE_S    = 0.0
+var float  TP_PRICE_L    = 0.0
+var float  TP_PRICE_S    = 0.0
+var float  PT_PRICE_L    = 0.0
+var float  PT_PRICE_S    = 0.0
+var string VCH_TIER      = "MODERATE"
+var float  SL_ADJ_FACTOR = 1.0
+var float  RR_ADJ        = 2.0
 
 // ─── EMISSION FUNCTIONS ──────────────────────────────────────────────────────
 var float LG2PI4 = 2.0 * math.log(2.0 * math.pi)
@@ -418,26 +434,28 @@ if z_atr > vol_shock_thr
     VOL_SHOCK_COUNT += 1
 else
     VOL_SHOCK_COUNT := 0
+
 vol_shock_fired = VOL_SHOCK_COUNT >= vol_shock_bars
 
 array.push(FLIP_HISTORY, VR)
 if array.size(FLIP_HISTORY) > flip_window
     array.shift(FLIP_HISTORY)
+
 var int flip_count = 0
 flip_count := 0
 if array.size(FLIP_HISTORY) >= 2
     for fi = 1 to array.size(FLIP_HISTORY) - 1
         if array.get(FLIP_HISTORY, fi) != array.get(FLIP_HISTORY, fi - 1)
             flip_count += 1
+
 flip_fired   = flip_count >= flip_limit
 conf_fired   = VCH < conf_collapse_thr and VCH > 0.0
 adaptive_any = vol_shock_fired or flip_fired or conf_fired
 
-// ─── DECIDE WHETHER TO RETRAIN ───────────────────────────────────────────────
+// ─── RETRAINING DECISION ─────────────────────────────────────────────────────
 DID_RETRAIN_NOW    := false
 ADAPTIVE_TRIGGERED := false
 
-// ✅ FIX: Increment di setiap bar confirmed (bukan hanya saat display)
 if barstate.isconfirmed
     BARS_SINCE_RETRAIN += 1
     if COOLDOWN_LEFT > 0
@@ -449,7 +467,7 @@ if use_adaptive and COOLDOWN_LEFT == 0 and adaptive_any
     should_retrain     := true
     ADAPTIVE_TRIGGERED := true
 
-// ─── MAIN HMM TRAINING ───────────────────────────────────────────────────────
+// ─── BAUM-WELCH TRAINING ─────────────────────────────────────────────────────
 if barstate.islast and should_retrain
     DID_RETRAIN_NOW    := true
     TOTAL_RETRAINS     += 1
@@ -462,105 +480,103 @@ if barstate.islast and should_retrain
     N = n_states
 
     if T >= 10
-
         for _it = 0 to bw_n - 1
-
             // Forward
             al  = array.new_float(T * N, 0.0)
             sc  = array.new_float(T, 1e-300)
             s0v = 0.0
-            for s = 0 to N-1
+            for s = 0 to N - 1
                 v = array.get(HP, s) * mvg_pdf_raw(array.get(OB1,0), array.get(OB2,0), array.get(OB3,0), array.get(OB4,0), s, HMU, HSG)
                 array.set(al, s, v)
                 s0v += v
             s0v := math.max(s0v, 1e-300)
             array.set(sc, 0, s0v)
-            for s = 0 to N-1
+            for s = 0 to N - 1
                 array.set(al, s, array.get(al, s) / s0v)
-            for t = 1 to T-1
+            for t = 1 to T - 1
                 stv = 0.0
-                for s = 0 to N-1
+                for s = 0 to N - 1
                     sm = 0.0
-                    for p = 0 to N-1
+                    for p = 0 to N - 1
                         sm += array.get(al, (t-1)*N+p) * array.get(HA, p*N+s)
                     v = sm * mvg_pdf_raw(array.get(OB1,t), array.get(OB2,t), array.get(OB3,t), array.get(OB4,t), s, HMU, HSG)
                     array.set(al, t*N+s, v)
                     stv += v
                 stv := math.max(stv, 1e-300)
                 array.set(sc, t, stv)
-                for s = 0 to N-1
+                for s = 0 to N - 1
                     array.set(al, t*N+s, array.get(al, t*N+s) / stv)
 
             // Backward
             be = array.new_float(T * N, 0.0)
-            for s = 0 to N-1
+            for s = 0 to N - 1
                 array.set(be, (T-1)*N+s, 1.0 / array.get(sc, T-1))
-            for rv = 0 to T-2
-                t   = T-2 - rv
+            for rv = 0 to T - 2
+                t   = T - 2 - rv
                 sct = array.get(sc, t)
-                for s = 0 to N-1
+                for s = 0 to N - 1
                     sm = 0.0
-                    for sn = 0 to N-1
+                    for sn = 0 to N - 1
                         bsn = mvg_pdf_raw(array.get(OB1,t+1), array.get(OB2,t+1), array.get(OB3,t+1), array.get(OB4,t+1), sn, HMU, HSG)
                         sm += array.get(HA, s*N+sn) * bsn * array.get(be, (t+1)*N+sn)
                     array.set(be, t*N+s, sm / sct)
 
             // Gamma
             gm = array.new_float(T * N, 0.0)
-            for t = 0 to T-1
+            for t = 0 to T - 1
                 gs = 0.0
-                for s = 0 to N-1
+                for s = 0 to N - 1
                     g = array.get(al, t*N+s) * array.get(be, t*N+s)
                     array.set(gm, t*N+s, g)
                     gs += g
                 gs := math.max(gs, 1e-300)
-                for s = 0 to N-1
+                for s = 0 to N - 1
                     array.set(gm, t*N+s, array.get(gm, t*N+s) / gs)
 
             // Xi
             xi = array.new_float((T-1)*N*N, 0.0)
-            for t = 0 to T-2
+            for t = 0 to T - 2
                 xs = 0.0
-                for i = 0 to N-1
-                    for j = 0 to N-1
+                for i = 0 to N - 1
+                    for j = 0 to N - 1
                         bj = mvg_pdf_raw(array.get(OB1,t+1), array.get(OB2,t+1), array.get(OB3,t+1), array.get(OB4,t+1), j, HMU, HSG)
                         xv = array.get(al,t*N+i) * array.get(HA,i*N+j) * bj * array.get(be,(t+1)*N+j)
                         array.set(xi, t*N*N+i*N+j, xv)
                         xs += xv
                 xs := math.max(xs, 1e-300)
-                for i = 0 to N-1
-                    for j = 0 to N-1
+                for i = 0 to N - 1
+                    for j = 0 to N - 1
                         array.set(xi, t*N*N+i*N+j, array.get(xi, t*N*N+i*N+j) / xs)
 
             // Update Pi
             psum = 0.0
-            for s = 0 to N-1
+            for s = 0 to N - 1
                 psum += array.get(gm, s)
             psum := math.max(psum, 1e-300)
-            for s = 0 to N-1
+            for s = 0 to N - 1
                 array.set(HP, s, array.get(gm, s) / psum)
 
             // Update A
-            for i = 0 to N-1
+            for i = 0 to N - 1
                 di = 0.0
-                for t = 0 to T-2
+                for t = 0 to T - 2
                     di += array.get(gm, t*N+i)
-                for j = 0 to N-1
+                for j = 0 to N - 1
                     nij = 0.0
-                    for t = 0 to T-2
+                    for t = 0 to T - 2
                         nij += array.get(xi, t*N*N+i*N+j)
                     array.set(HA, i*N+j, math.max(di > 1e-300 ? nij/di : 1.0/N, 1e-8))
                 rs = 0.0
-                for j = 0 to N-1
+                for j = 0 to N - 1
                     rs += array.get(HA, i*N+j)
                 if rs > 0
-                    for j = 0 to N-1
+                    for j = 0 to N - 1
                         array.set(HA, i*N+j, array.get(HA, i*N+j) / rs)
 
             // Update Mu & Sigma
-            for s = 0 to N-1
+            for s = 0 to N - 1
                 gs2 = 0.0
-                for t = 0 to T-1
+                for t = 0 to T - 1
                     gs2 += array.get(gm, t*N+s)
                 has_occ      = gs2 >= float(T) * min_occ_pct
                 occ_w        = math.min(gs2 / float(T), 1.0)
@@ -568,7 +584,7 @@ if barstate.islast and should_retrain
                 for d = 0 to D_FEAT - 1
                     if has_occ
                         wm = 0.0
-                        for t = 0 to T-1
+                        for t = 0 to T - 1
                             g     = array.get(gm, t*N+s)
                             obs_d = d == 0 ? array.get(OB1,t) : d == 1 ? array.get(OB2,t) : d == 2 ? array.get(OB3,t) : array.get(OB4,t)
                             wm   += g * obs_d
@@ -576,7 +592,7 @@ if barstate.islast and should_retrain
                         mu_nd = (1.0 - adaptive_reg) * mu_bw + adaptive_reg * array.get(PRIOR_MU, s*5+d)
                         array.set(HMU, s*5+d, mu_nd)
                         wv = 0.0
-                        for t = 0 to T-1
+                        for t = 0 to T - 1
                             g     = array.get(gm, t*N+s)
                             obs_d = d == 0 ? array.get(OB1,t) : d == 1 ? array.get(OB2,t) : d == 2 ? array.get(OB3,t) : array.get(OB4,t)
                             diff  = obs_d - mu_nd
@@ -588,20 +604,20 @@ if barstate.islast and should_retrain
                         array.set(HMU, s*5+d, 0.7 * array.get(HMU, s*5+d) + 0.3 * array.get(PRIOR_MU, s*5+d))
                         array.set(HSG, s*5+d, math.max(0.7 * array.get(HSG, s*5+d) + 0.3 * array.get(PRIOR_SG, s*5+d), float(sig_floor)))
 
-        // State label ordering
+        // State label reordering
         mu_ret_arr = array.new_float(N, 0.0)
-        for s = 0 to N-1
+        for s = 0 to N - 1
             array.set(mu_ret_arr, s, array.get(HMU, s*5+0))
         bull_cand = 0
         bear_cand = 0
-        for s = 1 to N-1
+        for s = 1 to N - 1
             if array.get(mu_ret_arr, s) > array.get(mu_ret_arr, bull_cand)
                 bull_cand := s
             if array.get(mu_ret_arr, s) < array.get(mu_ret_arr, bear_cand)
                 bear_cand := s
         side_cand = bull_cand == 0 ? (bear_cand == 1 ? 2 : 1) : (bear_cand == 0 ? (bull_cand == 1 ? 2 : 1) : 0)
         min_abs_s = 1e30
-        for s = 0 to N-1
+        for s = 0 to N - 1
             if s != bull_cand and s != bear_cand
                 av = math.abs(array.get(mu_ret_arr, s))
                 if av < min_abs_s
@@ -609,7 +625,7 @@ if barstate.islast and should_retrain
                     side_cand := s
         vbull_cand = -1
         vbear_cand = -1
-        for s = 0 to N-1
+        for s = 0 to N - 1
             if s != bull_cand and s != bear_cand and s != side_cand
                 if vbull_cand == -1
                     vbull_cand := s
@@ -628,7 +644,7 @@ if barstate.islast and should_retrain
         if N >= 5
             array.set(mpv, 4, vbear_cand >= 0 ? vbear_cand : 1)
         needs_reorder = false
-        for ni = 0 to N-1
+        for ni = 0 to N - 1
             if array.get(mpv, ni) != ni
                 needs_reorder := true
         if needs_reorder
@@ -636,23 +652,23 @@ if barstate.islast and should_retrain
             tsg = array.new_float(25, 0.0)
             tpi = array.new_float(5,  0.0)
             tA  = array.new_float(25, 0.0)
-            for ni = 0 to N-1
+            for ni = 0 to N - 1
                 oi = array.get(mpv, ni)
                 array.set(tpi, ni, array.get(HP, oi))
-                for d = 0 to D_FEAT-1
+                for d = 0 to D_FEAT - 1
                     array.set(tmu, ni*5+d, array.get(HMU, oi*5+d))
                     array.set(tsg, ni*5+d, array.get(HSG, oi*5+d))
-            for ni = 0 to N-1
+            for ni = 0 to N - 1
                 oi = array.get(mpv, ni)
-                for nj = 0 to N-1
+                for nj = 0 to N - 1
                     oj = array.get(mpv, nj)
                     array.set(tA, ni*N+nj, array.get(HA, oi*N+oj))
-            for s = 0 to N-1
+            for s = 0 to N - 1
                 array.set(HP, s, array.get(tpi, s))
-                for d = 0 to D_FEAT-1
+                for d = 0 to D_FEAT - 1
                     array.set(HMU, s*5+d, array.get(tmu, s*5+d))
                     array.set(HSG, s*5+d, array.get(tsg, s*5+d))
-            for idx = 0 to N*N-1
+            for idx = 0 to N*N - 1
                 array.set(HA, idx, array.get(tA, idx))
 
         HP_CACHE  := array.copy(HP)
@@ -666,19 +682,18 @@ if barstate.islast
     N = n_states
 
     if T >= 10
-
         NEG_INF = -1e30
         log_dl  = array.new_float(T * N, NEG_INF)
         psi_v   = array.new_int(T * N, 0)
-        for s = 0 to N-1
+        for s = 0 to N - 1
             lp_s = array.get(HP_CACHE, s) > 1e-300 ? math.log(array.get(HP_CACHE, s)) : -500.0
             lb_s = log_mvg(array.get(OB1,0), array.get(OB2,0), array.get(OB3,0), array.get(OB4,0), s)
             array.set(log_dl, s, lp_s + lb_s)
-        for t = 1 to T-1
-            for s = 0 to N-1
+        for t = 1 to T - 1
+            for s = 0 to N - 1
                 max_lv = NEG_INF
                 max_pv = 0
-                for p = 0 to N-1
+                for p = 0 to N - 1
                     la = array.get(HA_CACHE, p*N+s) > 1e-300 ? math.log(array.get(HA_CACHE, p*N+s)) : -500.0
                     lv = array.get(log_dl, (t-1)*N+p) + la
                     if lv > max_lv
@@ -691,20 +706,20 @@ if barstate.islast
         vpath = array.new_int(T, 0)
         lmx   = NEG_INF
         ls    = 0
-        for s = 0 to N-1
+        for s = 0 to N - 1
             if array.get(log_dl, (T-1)*N+s) > lmx
                 lmx := array.get(log_dl, (T-1)*N+s)
                 ls  := s
         array.set(vpath, T-1, ls)
-        for rv2 = 0 to T-2
-            t = T-2 - rv2
+        for rv2 = 0 to T - 2
+            t = T - 2 - rv2
             array.set(vpath, t, array.get(psi_v, (t+1)*N + array.get(vpath, t+1)))
 
         raw_vpath = array.copy(vpath)
 
         cur_state = array.get(vpath, 0)
         cur_dur   = 1
-        for t = 1 to T-1
+        for t = 1 to T - 1
             nxt = array.get(vpath, t)
             if nxt != cur_state
                 min_d = cur_state == 0 ? min_dur_s : min_dur_b
@@ -720,7 +735,7 @@ if barstate.islast
         VR := array.get(vpath, T-1)
 
         dur_count = 0
-        for dv = T-1 to 0
+        for dv = T - 1 to 0
             if array.get(vpath, dv) == VR
                 dur_count += 1
             else
@@ -729,7 +744,7 @@ if barstate.islast
 
         raw_final = array.get(raw_vpath, T-1)
         raw_dur   = 0
-        for dv2 = T-1 to 0
+        for dv2 = T - 1 to 0
             if array.get(raw_vpath, dv2) == raw_final
                 raw_dur += 1
             else
@@ -740,48 +755,49 @@ if barstate.islast
         a2  = array.new_float(T * N, 0.0)
         s2c = array.new_float(T, 1e-300)
         s0b = 0.0
-        for s = 0 to N-1
-            v = array.get(HP_CACHE,s) * mvg_pdf(array.get(OB1,0), array.get(OB2,0), array.get(OB3,0), array.get(OB4,0), s)
+        for s = 0 to N - 1
+            v = array.get(HP_CACHE, s) * mvg_pdf(array.get(OB1,0), array.get(OB2,0), array.get(OB3,0), array.get(OB4,0), s)
             array.set(a2, s, v)
             s0b += v
         s0b := math.max(s0b, 1e-300)
         array.set(s2c, 0, s0b)
-        for s = 0 to N-1
-            array.set(a2, s, array.get(a2,s) / s0b)
-        for t = 1 to T-1
+        for s = 0 to N - 1
+            array.set(a2, s, array.get(a2, s) / s0b)
+        for t = 1 to T - 1
             stb = 0.0
-            for s = 0 to N-1
+            for s = 0 to N - 1
                 sm = 0.0
-                for p3 = 0 to N-1
-                    sm += array.get(a2,(t-1)*N+p3) * array.get(HA_CACHE,p3*N+s)
+                for p3 = 0 to N - 1
+                    sm += array.get(a2, (t-1)*N+p3) * array.get(HA_CACHE, p3*N+s)
                 v = sm * mvg_pdf(array.get(OB1,t), array.get(OB2,t), array.get(OB3,t), array.get(OB4,t), s)
                 array.set(a2, t*N+s, v)
                 stb += v
             stb := math.max(stb, 1e-300)
             array.set(s2c, t, stb)
-            for s = 0 to N-1
-                array.set(a2, t*N+s, array.get(a2,t*N+s) / stb)
+            for s = 0 to N - 1
+                array.set(a2, t*N+s, array.get(a2, t*N+s) / stb)
+
         b2 = array.new_float(T * N, 0.0)
-        for s = 0 to N-1
-            array.set(b2,(T-1)*N+s, 1.0 / array.get(s2c, T-1))
-        for rv3 = 0 to T-2
-            t   = T-2 - rv3
+        for s = 0 to N - 1
+            array.set(b2, (T-1)*N+s, 1.0 / array.get(s2c, T-1))
+        for rv3 = 0 to T - 2
+            t   = T - 2 - rv3
             sct = array.get(s2c, t)
-            for s = 0 to N-1
+            for s = 0 to N - 1
                 sm = 0.0
-                for sn = 0 to N-1
+                for sn = 0 to N - 1
                     bsn = mvg_pdf(array.get(OB1,t+1), array.get(OB2,t+1), array.get(OB3,t+1), array.get(OB4,t+1), sn)
-                    sm += array.get(HA_CACHE,s*N+sn) * bsn * array.get(b2,(t+1)*N+sn)
+                    sm += array.get(HA_CACHE, s*N+sn) * bsn * array.get(b2, (t+1)*N+sn)
                 array.set(b2, t*N+s, sm / sct)
 
         gf = 0.0
-        for s = 0 to N-1
-            g = array.get(a2,(T-1)*N+s) * array.get(b2,(T-1)*N+s)
+        for s = 0 to N - 1
+            g = array.get(a2, (T-1)*N+s) * array.get(b2, (T-1)*N+s)
             array.set(VP, s, g)
             gf += g
         gf := math.max(gf, 1e-300)
-        for s = 0 to N-1
-            array.set(VP, s, array.get(VP,s) / gf)
+        for s = 0 to N - 1
+            array.set(VP, s, array.get(VP, s) / gf)
 
         if n_states < 5
             for s_z = n_states to 4
@@ -791,49 +807,37 @@ if barstate.islast
         VC  := array.get(VP, VR)
         VCH := calc_conf_entropy(VP, n_states)
 
-// ─── [NEW v7] ADAPTIVE SL/TP KALKULASI ───────────────────────────────────────
-// Dijalankan setiap bar menggunakan VCH + VR yang sudah diperbarui.
-// Semua logika dalam satu blok agar mudah dibaca dan diaudit.
+// ─── ADAPTIVE SL/TP ──────────────────────────────────────────────────────────
 atr_sl = ta.atr(atr_len_sl)
 
-// (1) Tentukan VCH tier
 is_strong   = VCH >= vch_strong
-is_weak     = VCH < vch_weak
+is_weak     = VCH <  vch_weak
 is_moderate = not is_strong and not is_weak
 
-VCH_TIER    := is_strong ? "STRONG" : is_weak ? "WEAK" : "MODERATE"
-
-// (2) Pilih faktor penyesuaian SL dari VCH tier
+VCH_TIER      := is_strong ? "STRONG" : is_weak ? "WEAK" : "MODERATE"
 SL_ADJ_FACTOR := is_strong ? sl_tight_pct : is_weak ? sl_wide_pct : 1.0
+RR_ADJ        := is_strong ? rr_strong    : is_weak ? rr_weak      : rr_moderate
 
-// (3) Pilih RR dari VCH tier
-RR_ADJ := is_strong ? rr_strong : is_weak ? rr_weak : rr_moderate
-
-// (4) Base SL multiplier dari regime
-// SIDE = na (tidak trade), BULL/BEAR/VBULL/VBEAR menggunakan inputnya masing-masing
 base_sl_mult = VR == 1 ? atr_bull_base : VR == 2 ? atr_bear_base : VR == 3 ? atr_vbull_base : VR == 4 ? atr_vbear_base : float(na)
 
-// (5) SL final = base * adj_factor (VCH ketat/lebar)
 SL_MULT_FINAL := na(base_sl_mult) ? float(na) : base_sl_mult * SL_ADJ_FACTOR
 RR_FINAL      := RR_ADJ
 
-// (6) Hitung poin SL dan TP
 SL_PTS := na(SL_MULT_FINAL) ? float(na) : atr_sl * SL_MULT_FINAL
 TP_PTS := na(SL_PTS)        ? float(na) : SL_PTS * RR_FINAL
 
-// (7) Harga aktual SL/TP dari close
-// Arah: BULL/VBULL = Long (SL di bawah, TP di atas)
-//        BEAR/VBEAR = Short (SL di atas, TP di bawah)
+ref_price = kf_sl_base ? kf_price : close
+
 is_long_regime  = VR == 1 or VR == 3
 is_short_regime = VR == 2 or VR == 4
 
-SL_PRICE_L := na(SL_PTS) ? float(na) : close - SL_PTS
-TP_PRICE_L := na(TP_PTS) ? float(na) : close + TP_PTS
-PT_PRICE_L := na(SL_PTS) ? float(na) : close + SL_PTS
+SL_PRICE_L := na(SL_PTS) ? float(na) : ref_price - SL_PTS
+TP_PRICE_L := na(TP_PTS) ? float(na) : ref_price + TP_PTS
+PT_PRICE_L := na(SL_PTS) ? float(na) : ref_price + SL_PTS
 
-SL_PRICE_S := na(SL_PTS) ? float(na) : close + SL_PTS
-TP_PRICE_S := na(TP_PTS) ? float(na) : close - TP_PTS
-PT_PRICE_S := na(SL_PTS) ? float(na) : close - SL_PTS
+SL_PRICE_S := na(SL_PTS) ? float(na) : ref_price + SL_PTS
+TP_PRICE_S := na(TP_PTS) ? float(na) : ref_price - TP_PTS
+PT_PRICE_S := na(SL_PTS) ? float(na) : ref_price - SL_PTS
 
 // ─── INSTANTANEOUS REGIME ────────────────────────────────────────────────────
 var int   ir_best    = 0
@@ -847,13 +851,16 @@ for s_ir = 0 to n_states - 1
         ir_best    := s_ir
 IR = ir_best
 
-// ─── REGIME RIBBON & WARNING ─────────────────────────────────────────────────
+// ─── PLOTS ───────────────────────────────────────────────────────────────────
 rib_col = IR == 1 ? color.new(CB,30) : IR == 2 ? color.new(CR,30) : IR == 3 ? color.new(CVB,30) : IR == 4 ? color.new(CVR,30) : color.new(CS,30)
 bgcolor(show_rib  ? rib_col : na, title="Regime Ribbon")
 bgcolor(show_warn and IR == 0 ? CWN : na, title="Sideways Warning")
 
-// ─── [NEW v7] SL/TP LINES DI CHART ───────────────────────────────────────────
-// Plot hanya saat ada sinyal terarah (bukan Sideways)
+plot(show_kf_plot ? kf_price : na, "KF Price",      color=CKF,                linewidth=2, style=plot.style_line)
+plot(show_kf_plot ? kf_upper : na, "KF Band Upper", color=color.new(CKF, 70), linewidth=1, style=plot.style_line)
+plot(show_kf_plot ? kf_lower : na, "KF Band Lower", color=color.new(CKF, 70), linewidth=1, style=plot.style_line)
+plot(show_kf_vel  ? kf_velocity : na, "KF Velocity", color=color.new(color.yellow, 40), linewidth=1, style=plot.style_histogram)
+
 sl_plot_long  = show_sltp_plot and is_long_regime  ? SL_PRICE_L : float(na)
 tp_plot_long  = show_sltp_plot and is_long_regime  ? TP_PRICE_L : float(na)
 pt_plot_long  = show_sltp_plot and is_long_regime  ? PT_PRICE_L : float(na)
@@ -861,12 +868,12 @@ sl_plot_short = show_sltp_plot and is_short_regime ? SL_PRICE_S : float(na)
 tp_plot_short = show_sltp_plot and is_short_regime ? TP_PRICE_S : float(na)
 pt_plot_short = show_sltp_plot and is_short_regime ? PT_PRICE_S : float(na)
 
-plot(sl_plot_long,  "SL Long",       color=color.new(CSL,20), linewidth=1, style=plot.style_linebr)
-plot(tp_plot_long,  "TP Long",       color=color.new(CTP,20), linewidth=1, style=plot.style_linebr)
-plot(pt_plot_long,  "Partial Long",  color=color.new(CPT,50), linewidth=1, style=plot.style_linebr)
-plot(sl_plot_short, "SL Short",      color=color.new(CSL,20), linewidth=1, style=plot.style_linebr)
-plot(tp_plot_short, "TP Short",      color=color.new(CTP,20), linewidth=1, style=plot.style_linebr)
-plot(pt_plot_short, "Partial Short", color=color.new(CPT,50), linewidth=1, style=plot.style_linebr)
+plot(sl_plot_long,  "SL Long",       color=color.new(CSL, 20), linewidth=1, style=plot.style_linebr)
+plot(tp_plot_long,  "TP Long",       color=color.new(CTP, 20), linewidth=1, style=plot.style_linebr)
+plot(pt_plot_long,  "Partial Long",  color=color.new(CPT, 50), linewidth=1, style=plot.style_linebr)
+plot(sl_plot_short, "SL Short",      color=color.new(CSL, 20), linewidth=1, style=plot.style_linebr)
+plot(tp_plot_short, "TP Short",      color=color.new(CTP, 20), linewidth=1, style=plot.style_linebr)
+plot(pt_plot_short, "Partial Short", color=color.new(CPT, 50), linewidth=1, style=plot.style_linebr)
 
 // ─── TRANSITION LABELS ───────────────────────────────────────────────────────
 var int LR = na
@@ -882,10 +889,10 @@ if barstate.isconfirmed and not na(IR) and held and IR != LR
     LR := IR
 
 // ─── TABLE DECLARATIONS ──────────────────────────────────────────────────────
-var table TBAN = table.new(gpos(ban_ps), 1, 7,  bgcolor=color.new(color.black,30), border_width=0)
+var table TBAN = table.new(gpos(ban_ps), 1, 8,  bgcolor=color.new(color.black,30), border_width=0)
 var table TMAT = table.new(gpos(mat_ps), 7, 9,  bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
 var table TSTT = table.new(gpos(stt_ps), 6, 5,  bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
-var table TSLT = table.new(gpos(slt_ps), 2, 10, bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
+var table TSLT = table.new(gpos(slt_ps), 2, 11, bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
 var table TEMT = table.new(gpos(emt_ps), 9, 9,  bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
 
 // ─── TABLE POPULATION ────────────────────────────────────────────────────────
@@ -893,7 +900,7 @@ if barstate.islast
     N = n_states
 
     exp_durs = array.new_float(N, 0.0)
-    for s = 0 to N-1
+    for s = 0 to N - 1
         diag_val = array.get(HA_CACHE, s*N+s)
         array.set(exp_durs, s, diag_val < 1.0 ? 1.0 / (1.0 - diag_val) : 99.0)
 
@@ -907,6 +914,10 @@ if barstate.islast
     za_str     = fmtf(z_atr)
     zs_str     = fmtf(z_slope)
     zv_str     = fmtf(z_vol)
+    kfp_str    = fmtprice(kf_price)
+    kfv_str    = fmtf(kf_velocity)
+    kfr_str    = fmtf(kf_residual)
+    kfb_str    = fmtf(kf_band)
 
     is_locked  = VDUR > VDUR_RAW * 2 and VDUR_RAW > 0
     dur_str    = str.tostring(VDUR) + "b(s)/" + str.tostring(VDUR_RAW) + "b(r)"
@@ -915,91 +926,74 @@ if barstate.islast
 
     retrain_mode = ADAPTIVE_TRIGGERED ? "ADAPTIVE" : "SCHEDULED"
     retrain_col  = ADAPTIVE_TRIGGERED ? color.rgb(255, 120, 50) : CDT
-    bars_left = math.max(retrain_interval - BARS_SINCE_RETRAIN, 0)
+    bars_left    = math.max(retrain_interval - BARS_SINCE_RETRAIN, 0)
     retrain_line = "Retrain #" + str.tostring(TOTAL_RETRAINS) + " (" + str.tostring(ADAPTIVE_RETRAINS) + " adp)  |  next: " + str.tostring(bars_left) + "b  |  cooldown: " + str.tostring(COOLDOWN_LEFT) + "b"
     trigger_line = retrain_mode + "  |  vol:" + str.tostring(VOL_SHOCK_COUNT) + "/" + str.tostring(vol_shock_bars) + "  flip:" + str.tostring(flip_count) + "/" + str.tostring(flip_limit) + "  conf:" + fmtp(VCH)
 
-    // Warna tier
     tier_col = is_strong ? CB : is_weak ? CR : color.rgb(255, 200, 0)
 
-    // ── BANNER ─────────────────────────────────────────────────────────
+    // ── BANNER ─────────────────────────────────────────────────────────────
     if show_ban
         table.cell(TBAN, 0, 0, "HMM Regime: " + rgi(VR), text_color=CWT, bgcolor=color.new(rgc(VR),30), text_size=gsz("large"), text_halign=text.align_center)
         table.cell(TBAN, 0, 1, rgd(VR), text_color=VR == 0 ? color.rgb(255,200,0) : CWT, bgcolor=color.new(color.black,50), text_size=sh, text_halign=text.align_center)
         table.cell(TBAN, 0, 2, "Conf(y): " + conf_str + "  |  Conf(H): " + conf_h_str + "  |  Tier: " + VCH_TIER + "  |  T=" + str.tostring(temp_scale,"#.#"), text_color=tier_col, bgcolor=color.new(color.black,60), text_size=sh, text_halign=text.align_center)
         table.cell(TBAN, 0, 3, "Dur: " + dur_str + lock_warn + "  |  Z ret=" + zr_str + " atr=" + za_str + " slope=" + zs_str + " vol=" + zv_str, text_color=dur_col, bgcolor=color.new(color.black,65), text_size=sh, text_halign=text.align_center)
-        table.cell(TBAN, 0, 4, "ATR=" + fmtf(atr_sl) + "  |  win=" + str.tostring(hmm_win) + "b  |  BW=" + str.tostring(bw_n) + "it  |  D=4  |  N=" + str.tostring(N) + "  |  slp=" + str.tostring(slope_per) + "b", text_color=CFT, bgcolor=color.new(color.black,70), text_size=sh, text_halign=text.align_center)
+        table.cell(TBAN, 0, 4, "ATR=" + fmtf(atr_sl) + "  |  win=" + str.tostring(hmm_win) + "b  |  BW=" + str.tostring(bw_n) + "it  |  D=4  |  N=" + str.tostring(N) + "  |  KF=" + (use_kf_feat ? "ON" : "OFF"), text_color=CFT, bgcolor=color.new(color.black,70), text_size=sh, text_halign=text.align_center)
+        table.cell(TBAN, 0, 5, "KF: price=" + kfp_str + "  vel=" + kfv_str + "  resid=" + kfr_str + "  band=±" + kfb_str + "  Q=" + fmtf(kf_q_adapt) + "  R=" + fmtf(kf_r), text_color=CKF, bgcolor=color.new(color.black,72), text_size=sh, text_halign=text.align_center)
         conf_lvl = VCH >= 0.70 ? "STRONG" : VCH >= 0.45 ? "MODERATE" : "WEAK"
         conf_col = VCH >= 0.70 ? CB : VCH >= 0.45 ? color.rgb(255,200,0) : CR
-        table.cell(TBAN, 0, 5, "Signal Strength: " + conf_lvl + "  (target: 45-75%)", text_color=conf_col, bgcolor=color.new(color.black,75), text_size=sh, text_halign=text.align_center)
-        table.cell(TBAN, 0, 6, retrain_line + "  [" + trigger_line + "]", text_color=retrain_col, bgcolor=color.new(color.black, DID_RETRAIN_NOW ? 40 : 80), text_size=sh, text_halign=text.align_center)
+        table.cell(TBAN, 0, 6, "Signal Strength: " + conf_lvl + "  (target: 45-75%)", text_color=conf_col, bgcolor=color.new(color.black,75), text_size=sh, text_halign=text.align_center)
+        table.cell(TBAN, 0, 7, retrain_line + "  [" + trigger_line + "]", text_color=retrain_col, bgcolor=color.new(color.black, DID_RETRAIN_NOW ? 40 : 80), text_size=sh, text_halign=text.align_center)
 
-    // ── [NEW v7] ADAPTIVE SL/TP TABLE ──────────────────────────────────
+    // ── ADAPTIVE SL/TP TABLE ───────────────────────────────────────────────
     if show_sltp_table
-        // Header
         table.cell(TSLT, 0, 0, "ADAPTIVE SL/TP", text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_left)
-        table.cell(TSLT, 1, 0, "Basis VCH", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
-
-        // Regime + Tier
+        table.cell(TSLT, 1, 0, "Basis VCH + KF",  text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         table.cell(TSLT, 0, 1, "Regime", text_color=CHD, bgcolor=CK, text_size=sh)
         table.cell(TSLT, 1, 1, rgi(VR) + " | " + VCH_TIER, text_color=tier_col, bgcolor=CK, text_size=sh, text_halign=text.align_right)
-
-        // VCH + threshold info
         table.cell(TSLT, 0, 2, "VCH / thr", text_color=CHD, bgcolor=CK, text_size=sh)
         table.cell(TSLT, 1, 2, conf_h_str + "  [S:" + fmtp(vch_strong) + " W:" + fmtp(vch_weak) + "]", text_color=tier_col, bgcolor=CK, text_size=sh, text_halign=text.align_right)
-
-        // SL multiplier breakdown
         sl_mult_str = na(SL_MULT_FINAL) ? "N/A" : "ATR x " + fmtf(SL_MULT_FINAL) + "  (base x " + fmtf(SL_ADJ_FACTOR) + ")"
         table.cell(TSLT, 0, 3, "SL Mult", text_color=CHD, bgcolor=CK, text_size=sh)
         table.cell(TSLT, 1, 3, sl_mult_str, text_color=CSL, bgcolor=CK, text_size=sh, text_halign=text.align_right)
-
-        // RR
         rr_str = na(SL_MULT_FINAL) ? "N/A" : "1 : " + fmtf(RR_FINAL)
         table.cell(TSLT, 0, 4, "Risk : Reward", text_color=CHD, bgcolor=CK, text_size=sh)
         table.cell(TSLT, 1, 4, rr_str, text_color=CTP, bgcolor=CK, text_size=sh, text_halign=text.align_right)
-
-        // SL poin + harga
-        sl_pts_str    = na(SL_PTS)     ? "N/A" : fmtf(SL_PTS) + " pts"
-        sl_price_str  = na(SL_PTS)     ? "N/A" : (is_long_regime ? fmtprice(SL_PRICE_L) : is_short_regime ? fmtprice(SL_PRICE_S) : "N/A")
+        sl_pts_str   = na(SL_PTS) ? "N/A" : fmtf(SL_PTS) + " pts"
+        sl_price_str = na(SL_PTS) ? "N/A" : (is_long_regime ? fmtprice(SL_PRICE_L) : is_short_regime ? fmtprice(SL_PRICE_S) : "N/A")
         table.cell(TSLT, 0, 5, "SL (pts / harga)", text_color=CHD, bgcolor=CK, text_size=sh)
         table.cell(TSLT, 1, 5, sl_pts_str + " / " + sl_price_str, text_color=CSL, bgcolor=CK, text_size=sv, text_halign=text.align_right)
-
-        // TP poin + harga
-        tp_pts_str    = na(TP_PTS)     ? "N/A" : fmtf(TP_PTS) + " pts"
-        tp_price_str  = na(TP_PTS)     ? "N/A" : (is_long_regime ? fmtprice(TP_PRICE_L) : is_short_regime ? fmtprice(TP_PRICE_S) : "N/A")
+        tp_pts_str   = na(TP_PTS) ? "N/A" : fmtf(TP_PTS) + " pts"
+        tp_price_str = na(TP_PTS) ? "N/A" : (is_long_regime ? fmtprice(TP_PRICE_L) : is_short_regime ? fmtprice(TP_PRICE_S) : "N/A")
         table.cell(TSLT, 0, 6, "TP (pts / harga)", text_color=CHD, bgcolor=CK, text_size=sh)
         table.cell(TSLT, 1, 6, tp_pts_str + " / " + tp_price_str, text_color=CTP, bgcolor=CK, text_size=sv, text_halign=text.align_right)
-
-        // Partial TP 1:1
-        pt_price_str  = na(SL_PTS)     ? "N/A" : (is_long_regime ? fmtprice(PT_PRICE_L) : is_short_regime ? fmtprice(PT_PRICE_S) : "N/A")
+        pt_price_str = na(SL_PTS) ? "N/A" : (is_long_regime ? fmtprice(PT_PRICE_L) : is_short_regime ? fmtprice(PT_PRICE_S) : "N/A")
         table.cell(TSLT, 0, 7, "Partial TP (1:1)", text_color=CHD, bgcolor=CK, text_size=sh)
         table.cell(TSLT, 1, 7, na(SL_PTS) ? "N/A" : fmtf(SL_PTS) + " pts / " + pt_price_str, text_color=color.new(CTP,35), bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TSLT, 0, 8, "Ref Price (KF/close)", text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1, 8, fmtprice(ref_price) + (kf_sl_base ? " [KF]" : " [close]"), text_color=CKF, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TSLT, 0, 9, "Close (raw)", text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1, 9, fmtprice(close), text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        status_str = VR == 0 ? "DON'T TRADE" : VCH_TIER == "WEAK" ? "SKIP / WAIT" : VCH_TIER == "STRONG" ? "HIGH PRIORITY" : "TRADE WITH CARE"
+        status_col = VR == 0 ? color.rgb(255,200,0) : VCH_TIER == "WEAK" ? CR : VCH_TIER == "STRONG" ? CB : CDT
+        table.cell(TSLT, 0, 10, "STATUS", text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1, 10, status_str, text_color=status_col, bgcolor=CK, text_size=sv, text_halign=text.align_right)
 
-        // Close referensi
-        table.cell(TSLT, 0, 8, "Close (referensi)", text_color=CHD, bgcolor=CK, text_size=sh)
-        table.cell(TSLT, 1, 8, fmtprice(close), text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
-
-        // Status
-        status_str  = VR == 0 ? "DON'T TRADE" : VCH_TIER == "WEAK" ? "SKIP / WAIT" : VCH_TIER == "STRONG" ? "HIGH PRIORITY" : "TRADE WITH CARE"
-        status_col  = VR == 0 ? color.rgb(255,200,0) : VCH_TIER == "WEAK" ? CR : VCH_TIER == "STRONG" ? CB : CDT
-        table.cell(TSLT, 0, 9, "STATUS", text_color=CFT, bgcolor=CK, text_size=sh)
-        table.cell(TSLT, 1, 9, status_str, text_color=status_col, bgcolor=CK, text_size=sv, text_halign=text.align_right)
-
-    // ── TRANSITION MATRIX ──────────────────────────────────────────────
+    // ── TRANSITION MATRIX ──────────────────────────────────────────────────
     if show_mat
         table.cell(TMAT, 0, 0, "TRANSITION MATRIX  (N=" + str.tostring(N) + ")", text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_left)
         for c_h = 1 to N
             table.cell(TMAT, c_h, 0, "", bgcolor=CK, text_color=CFT, text_size=sh)
         table.cell(TMAT, N+1, 0, "Baum-Welch", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         table.cell(TMAT, 0, 1, "DARI \\ KE", text_color=CHD, bgcolor=CK, text_size=sh)
-        for c_h = 0 to N-1
+        for c_h = 0 to N - 1
             table.cell(TMAT, c_h+1, 1, rgn(c_h), text_color=rgc(c_h), bgcolor=CK, text_size=sh, text_halign=text.align_center)
         table.cell(TMAT, N+1, 1, "E[dur]", text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
-        for r_m = 0 to N-1
+        for r_m = 0 to N - 1
             isCur = r_m == VR
             rowBg = isCur ? color.new(CA, 78) : CK
             table.cell(TMAT, 0, r_m+2, rgn(r_m), text_color=isCur ? CWT : CHD, bgcolor=rowBg, text_size=sh)
-            for c_m = 0 to N-1
+            for c_m = 0 to N - 1
                 p_m    = array.get(HA_CACHE, r_m*N+c_m)
                 isDiag = r_m == c_m
                 isHi   = isCur and c_m == VR
@@ -1008,14 +1002,14 @@ if barstate.islast
                 table.cell(TMAT, c_m+1, r_m+2, fmtp(p_m), text_color=cTxt, bgcolor=cBg, text_size=sh, text_halign=text.align_center)
             table.cell(TMAT, N+1, r_m+2, fmtd(array.get(exp_durs, r_m)), text_color=CDT, bgcolor=CDG, text_size=sh, text_halign=text.align_center)
         table.cell(TMAT, 0, N+2, "P(state|obs)", text_color=CFT, bgcolor=CK, text_size=sh)
-        for c_p = 0 to N-1
-            table.cell(TMAT, c_p+1, N+2, fmtp(array.get(VP,c_p)), text_color=rgc(c_p), bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        for c_p = 0 to N - 1
+            table.cell(TMAT, c_p+1, N+2, fmtp(array.get(VP, c_p)), text_color=rgc(c_p), bgcolor=CK, text_size=sh, text_halign=text.align_center)
         table.cell(TMAT, 0, N+3, "dur: s=" + str.tostring(VDUR) + "b r=" + str.tostring(VDUR_RAW) + "b", text_color=dur_col, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         table.cell(TMAT, N+1, N+3, "Log-Viterbi", text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_right)
 
-    // ── EMISSION PARAMETERS ────────────────────────────────────────────
+    // ── EMISSION PARAMETERS ────────────────────────────────────────────────
     if show_emit
-        table.cell(TEMT, 0, 0, "EMISSION  (D=4 multivariate)", text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TEMT, 0, 0, "EMISSION  (D=4" + (use_kf_feat ? " KF-enhanced)" : ")"), text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_left)
         table.cell(TEMT, 1, 0, "mu_ret",   text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_center)
         table.cell(TEMT, 2, 0, "mu_atr",   text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_center)
         table.cell(TEMT, 3, 0, "mu_slope", text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_center)
@@ -1024,9 +1018,9 @@ if barstate.islast
         table.cell(TEMT, 6, 0, "sg_atr",   text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_center)
         table.cell(TEMT, 7, 0, "P(state)", text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_center)
         table.cell(TEMT, 8, 0, "E[dur]",   text_color=CHD, bgcolor=CK, text_size=sh, text_halign=text.align_center)
-        for s5 = 0 to N-1
+        for s5 = 0 to N - 1
             isCur5 = s5 == VR
-            rowBg5 = isCur5 ? color.new(CA,80) : CK
+            rowBg5 = isCur5 ? color.new(CA, 80) : CK
             ec     = rgc(s5)
             exp_dv = array.get(exp_durs, s5)
             table.cell(TEMT, 0, s5+1, rgn(s5) + (isCur5 ? " <" : ""), text_color=isCur5 ? CWT : ec, bgcolor=rowBg5, text_size=sh)
@@ -1048,21 +1042,21 @@ if barstate.islast
         table.cell(TEMT, 7, N+1, "BW=" + str.tostring(bw_n) + " T=" + str.tostring(temp_scale,"#.#"), text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         table.cell(TEMT, 8, N+1, "int=" + str.tostring(retrain_interval) + "b", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
 
-    // ── STATIONARY DISTRIBUTION ────────────────────────────────────────
+    // ── STATIONARY DISTRIBUTION ────────────────────────────────────────────
     if show_stat
         table.cell(TSTT, 0, 0, "LONG-RUN DISTRIBUTION  (N=" + str.tostring(N) + ")", text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_left)
-        for c_st = 1 to N-1
+        for c_st = 1 to N - 1
             table.cell(TSTT, c_st, 0, "", bgcolor=CK, text_color=CFT, text_size=sh)
         table.cell(TSTT, N, 0, "A^" + str.tostring(stat_pow), text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
-        for c_st = 0 to N-1
+        for c_st = 0 to N - 1
             table.cell(TSTT, c_st, 1, rgn(c_st), text_color=rgc(c_st), bgcolor=CK, text_size=sh, text_halign=text.align_center)
         table.cell(TSTT, N, 1, "Conf(H)", text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
-        for c_st = 0 to N-1
+        for c_st = 0 to N - 1
             table.cell(TSTT, c_st, 2, fmtp(array.get(MS, c_st)), text_color=CDT, bgcolor=CDG, text_size=sv, text_halign=text.align_center, text_valign=text.align_center)
         table.cell(TSTT, N, 2, conf_h_str, text_color=CDT, bgcolor=CDG, text_size=sv, text_halign=text.align_center, text_valign=text.align_center)
         table.cell(TSTT, 0, 3, "steady state — distribusi jangka panjang", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_left)
         for c_st = 1 to N
             table.cell(TSTT, c_st, 3, c_st == N ? "live" : "", text_color=c_st == N ? CA : CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         table.cell(TSTT, 0, 4, "current gamma (T-scaled)", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
-        for c_st = 0 to N-1
-            table.cell(TSTT, c_st, 4, fmtp(array.get(VP,c_st)), text_color=rgc(c_st), bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        for c_st = 0 to N - 1
+            table.cell(TSTT, c_st, 4, fmtp(array.get(VP, c_st)), text_color=rgc(c_st), bgcolor=CK, text_size=sh, text_halign=text.align_center)
