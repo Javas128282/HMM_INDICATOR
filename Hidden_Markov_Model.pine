@@ -1,18 +1,32 @@
 //@version=6
 // ═══════════════════════════════════════════════════════════════════════════
-// DST HMM v8 — XAUUSD + Kalman Filter Integration
+// DST HMM v9 — XAUUSD + Kalman Filter Integration
+// IMPROVEMENTS v9:
+//   [1] Regime Strength Forecast  — derivative of P(state|obs) over a
+//       rolling window → momentum/acceleration of posterior probability,
+//       giving a forward-looking strength signal per state.
+//   [2] Margin Confidence         — max_prob − second_max_prob replaces
+//       entropy as the *local* discriminability metric, keeping entropy
+//       as a global diversity measure alongside it.
+//   [3] Kalman Forecast           — N-step ahead price + band forecast
+//       using the kinematic (position + velocity) state model; displayed
+//       as a projected line with expanding uncertainty cone.
 // ═══════════════════════════════════════════════════════════════════════════
-indicator("DST HMM v8 - XAUUSD (+ Kalman Filter)", overlay = true, max_labels_count = 500)
+indicator("DST HMM v9 - XAUUSD (+ Kalman Forecast)", overlay = true, max_labels_count = 500)
 
 // ─── INPUTS ──────────────────────────────────────────────────────────────────
 grp_kf  = "Kalman Filter"
+grp_kff = "Kalman Forecast"
 grp_h   = "HMM Training"
 grp_rt  = "Retraining Schedule"
 grp_f   = "Feature Settings"
 grp_sl  = "Adaptive SL/TP"
 grp_d   = "Display"
 grp_p   = "Table Positions"
+grp_rsf = "Regime Strength Forecast"
+grp_mc  = "Margin Confidence"
 
+// ── Kalman Filter ─────────────────────────────────────────────────────────
 kf_q_base    = input.float(0.01,  "Process Noise Q (base)",          minval=0.0001, maxval=1.0,  step=0.001, group=grp_kf)
 kf_q_atr_mul = input.float(2.0,   "Q ATR Multiplier (adaptive Q)",   minval=0.0,   maxval=10.0, step=0.1,   group=grp_kf)
 kf_r         = input.float(1.0,   "Measurement Noise R",             minval=0.01,  maxval=10.0, step=0.01,  group=grp_kf)
@@ -22,6 +36,15 @@ kf_sl_base   = input.bool(true,   "SL/TP Berbasis KF Price",         group=grp_k
 show_kf_plot = input.bool(true,   "Plot KF Line + Band di Chart",    group=grp_kf)
 show_kf_vel  = input.bool(false,  "Plot KF Velocity (histogram)",    group=grp_kf)
 
+// ── Kalman Forecast [NEW v9] ───────────────────────────────────────────────
+show_kf_fcast    = input.bool(true,  "Show Kalman N-Step Forecast",   group=grp_kff)
+kf_fcast_steps   = input.int(10,     "Forecast Steps (bars ahead)",   minval=1, maxval=50, group=grp_kff)
+kf_fcast_cone    = input.float(1.0,  "Forecast Cone Multiplier",      minval=0.1, maxval=5.0, step=0.1, group=grp_kff)
+kf_fcast_col_up  = input.color(color.rgb(80,200,255,60),  "Forecast Color (up trend)",   group=grp_kff)
+kf_fcast_col_dn  = input.color(color.rgb(255,150,80,60),  "Forecast Color (down trend)", group=grp_kff)
+kf_fcast_col_flat= input.color(color.rgb(180,180,180,60), "Forecast Color (flat)",       group=grp_kff)
+
+// ── HMM Training ──────────────────────────────────────────────────────────
 n_states          = input.int(3,     "Jumlah Hidden States (N)",          minval=2, maxval=5,    group=grp_h)
 hmm_win           = input.int(150,   "Training Window (bars)",            minval=20, maxval=500, group=grp_h)
 bw_n              = input.int(3,     "Baum-Welch Iterations",             minval=1, maxval=20,   group=grp_h)
@@ -33,6 +56,7 @@ reg_str           = input.float(0.30,"Regularization Strength",           minval
 min_occ_pct       = input.float(0.05,"Min State Occupancy (%T)",          minval=0.01, maxval=0.3, step=0.01, group=grp_h)
 temp_scale        = input.float(3.0, "Posterior Temperature",             minval=0.5, maxval=10.0, step=0.5,  group=grp_h)
 
+// ── Retraining Schedule ───────────────────────────────────────────────────
 retrain_interval  = input.int(20,    "Retraining Interval (bars)",        minval=1, maxval=200,  group=grp_rt)
 use_adaptive      = input.bool(true, "Adaptive Retraining Trigger",       group=grp_rt)
 vol_shock_thr     = input.float(2.0, "Vol Shock Threshold (z_atr)",       minval=1.0, maxval=5.0, step=0.1, group=grp_rt)
@@ -42,12 +66,14 @@ flip_limit        = input.int(4,     "Max Regime Flips in Window",        minval
 conf_collapse_thr = input.float(0.20,"Confidence Collapse Threshold",     minval=0.05, maxval=0.60, step=0.05, group=grp_rt)
 retrain_cooldown  = input.int(5,     "Adaptive Retraining Cooldown (bars)", minval=1, maxval=50, group=grp_rt)
 
+// ── Feature Settings ──────────────────────────────────────────────────────
 z_win     = input.int(20,  "Z-Score Window",               minval=5, maxval=100,  group=grp_f)
 ema_len   = input.int(21,  "EMA Length (fallback slope)",  minval=5, maxval=100,  group=grp_f)
 slope_per = input.int(14,  "Slope Lookback (fallback)",    minval=1, maxval=50,   group=grp_f)
 atr_len_f = input.int(14,  "ATR Length (fitur)",           minval=1, maxval=50,   group=grp_f)
 vol_len_f = input.int(20,  "Volume Z-Score Window",        minval=5, maxval=100,  group=grp_f)
 
+// ── Adaptive SL/TP ────────────────────────────────────────────────────────
 atr_len_sl    = input.int(14,    "ATR Length (SL/TP)",               minval=1, maxval=50, group=grp_sl)
 atr_bull_base = input.float(1.2, "Base SL Mult - Bull",             minval=0.3, maxval=5.0, step=0.1, group=grp_sl)
 atr_bear_base = input.float(1.5, "Base SL Mult - Bear",             minval=0.3, maxval=5.0, step=0.1, group=grp_sl)
@@ -63,6 +89,19 @@ rr_weak       = input.float(1.0, "RR Ratio - WEAK",                 minval=0.5, 
 show_sltp_table = input.bool(true, "Tampilkan Tabel Adaptive SL/TP", group=grp_sl)
 show_sltp_plot  = input.bool(true, "Plot SL/TP Lines di Chart",      group=grp_sl)
 
+// ── Regime Strength Forecast [NEW v9] ────────────────────────────────────
+rsf_win       = input.int(5,    "RSF: Derivative Window (bars)",    minval=2, maxval=20, group=grp_rsf)
+rsf_smooth    = input.int(3,    "RSF: Smoothing (EMA length)",      minval=1, maxval=10, group=grp_rsf)
+rsf_accel_win = input.int(3,    "RSF: Acceleration Window",         minval=1, maxval=10, group=grp_rsf)
+show_rsf      = input.bool(true,"RSF: Show in Banner & Table",      group=grp_rsf)
+
+// ── Margin Confidence [NEW v9] ────────────────────────────────────────────
+show_margin_conf = input.bool(true, "MC: Show Margin Confidence",   group=grp_mc)
+mc_smooth        = input.int(3,     "MC: Smoothing Window",         minval=1, maxval=10, group=grp_mc)
+mc_strong_thr    = input.float(0.25,"MC: Strong Threshold",         minval=0.05, maxval=0.90, step=0.05, group=grp_mc)
+mc_weak_thr      = input.float(0.10,"MC: Weak Threshold",           minval=0.01, maxval=0.50, step=0.05, group=grp_mc)
+
+// ── Display ───────────────────────────────────────────────────────────────
 show_rib  = input.bool(true, "Regime Ribbon",     group=grp_d)
 show_warn = input.bool(true, "Sideways Warning",  group=grp_d)
 show_ban  = input.bool(true, "Regime Banner",     group=grp_d)
@@ -73,6 +112,7 @@ show_lbl  = input.bool(true, "Label Transitions", group=grp_d)
 min_hold  = input.int(4,     "Min Hold Bars",     minval=1, maxval=50, group=grp_d)
 tsize     = input.string("normal","Table Text Size", options=["small","normal","large","huge"], group=grp_d)
 
+// ── Table Positions ───────────────────────────────────────────────────────
 ban_ps = input.string("top_left",    "Banner",     options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group=grp_p)
 mat_ps = input.string("top_right",   "Matrix",     options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group=grp_p)
 stt_ps = input.string("bottom_right","Stationary", options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group=grp_p)
@@ -119,6 +159,7 @@ fmtp(p)     => str.tostring(math.round(p * 100)) + "%"
 fmtf(v)     => str.tostring(math.round(v * 100) / 100.0, "#.##")
 fmtd(v)     => str.tostring(math.round(v * 10) / 10.0, "#.#") + "b"
 fmtprice(v) => str.tostring(math.round(v * 100) / 100.0, "#.##")
+fmtsgn(v)   => v > 0 ? "+" + fmtf(v) : fmtf(v)
 
 sv = gsz(tsize)
 sh = gszh(tsize)
@@ -212,6 +253,102 @@ kf_band     = math.sqrt(math.max(kf_variance, 0.0)) * kf_band_mult
 kf_upper    = kf_price + kf_band
 kf_lower    = kf_price - kf_band
 
+// ─── [NEW v9] KALMAN N-STEP FORECAST ────────────────────────────────────────
+// Propagate the kinematic model forward k steps without new measurements.
+// Uncertainty grows as: P_k = F^k * P * (F^k)' + sum of Q contributions.
+// For 2x2 model F=[[1,1],[0,1]], simplified diagonal variance propagation:
+//   var_pos(k) = kfp00 + 2*k*kfp01 + k^2*kfp11 + k*kf_qp + 0.5*k*(k-1)*kf_qv
+// This gives an expanding cone that respects current uncertainty.
+
+// We compute forecast arrays at barstate.islast and plot via lines/labels.
+var array<float> KF_FC_MID   = array.new_float(51, na)  // mid forecast
+var array<float> KF_FC_UP    = array.new_float(51, na)  // upper band
+var array<float> KF_FC_LO    = array.new_float(51, na)  // lower band
+var array<int>   KF_FC_BIDX  = array.new_int(51, 0)     // bar indices
+
+// Lines for forecast cone (persistent, recreated each bar)
+var line  KF_FC_LINE_MID  = na
+var line  KF_FC_LINE_UP   = na
+var line  KF_FC_LINE_LO   = na
+var label KF_FC_LABEL     = na
+// Arrays of lines for multi-step cone segments
+var array<line> KF_FC_SEGS_MID = array.new_line(0)
+var array<line> KF_FC_SEGS_UP  = array.new_line(0)
+var array<line> KF_FC_SEGS_LO  = array.new_line(0)
+
+if barstate.islast and show_kf_fcast
+    // Delete old forecast lines
+    for ln in KF_FC_SEGS_MID
+        line.delete(ln)
+    for ln in KF_FC_SEGS_UP
+        line.delete(ln)
+    for ln in KF_FC_SEGS_LO
+        line.delete(ln)
+    array.clear(KF_FC_SEGS_MID)
+    array.clear(KF_FC_SEGS_UP)
+    array.clear(KF_FC_SEGS_LO)
+    line.delete(KF_FC_LINE_MID)
+    line.delete(KF_FC_LINE_UP)
+    line.delete(KF_FC_LINE_LO)
+    label.delete(KF_FC_LABEL)
+
+    // Determine trend color from velocity sign
+    fc_vel_sign = kf_velocity > 0.01 * ta.atr(atr_len_f) ? 1 :
+                  kf_velocity < -0.01 * ta.atr(atr_len_f) ? -1 : 0
+    fc_col_mid  = fc_vel_sign > 0 ? kf_fcast_col_up :
+                  fc_vel_sign < 0 ? kf_fcast_col_dn : kf_fcast_col_flat
+    fc_col_band = color.new(fc_col_mid, 80)
+
+    // Propagate state forward k steps
+    fc_x0 = kfx0
+    fc_x1 = kfx1
+    // Variance propagation (no new measurements)
+    fc_p00 = kfp00
+    fc_p01 = kfp01
+    fc_p10 = kfp10
+    fc_p11 = kfp11
+
+    int steps = math.min(kf_fcast_steps, 50)
+    prev_mid  = kfx0
+    prev_up   = kfx0 + kf_band
+    prev_lo   = kfx0 - kf_band
+
+    for k = 1 to steps
+        // Predict one step ahead (no measurement update)
+        new_x0   = fc_x0 + fc_x1
+        new_x1   = fc_x1
+        // Covariance propagation F*P*F' + Q
+        new_p00  = fc_p00 + fc_p01 + fc_p10 + fc_p11 + kf_qp
+        new_p01  = fc_p01 + fc_p11
+        new_p10  = fc_p10 + fc_p11
+        new_p11  = fc_p11 + kf_qv
+        fc_x0   := new_x0
+        fc_x1   := new_x1
+        fc_p00  := new_p00
+        fc_p01  := new_p01
+        fc_p10  := new_p10
+        fc_p11  := new_p11
+        fc_band  = math.sqrt(math.max(fc_p00, 0.0)) * kf_band_mult * kf_fcast_cone
+        curr_mid = fc_x0
+        curr_up  = fc_x0 + fc_band
+        curr_lo  = fc_x0 - fc_band
+        bidx     = bar_index + k
+        array.push(KF_FC_SEGS_MID, line.new(bidx-1, prev_mid, bidx, curr_mid, color=fc_col_mid, width=2, style=line.style_dotted))
+        array.push(KF_FC_SEGS_UP,  line.new(bidx-1, prev_up,  bidx, curr_up,  color=fc_col_band, width=1, style=line.style_dotted))
+        array.push(KF_FC_SEGS_LO,  line.new(bidx-1, prev_lo,  bidx, curr_lo,  color=fc_col_band, width=1, style=line.style_dotted))
+        prev_mid := curr_mid
+        prev_up  := curr_up
+        prev_lo  := curr_lo
+
+    // Label at end of forecast
+    fc_dir_str = fc_vel_sign > 0 ? "↑" : fc_vel_sign < 0 ? "↓" : "→"
+    KF_FC_LABEL := label.new(bar_index + steps, prev_mid,
+         "KF+" + str.tostring(steps) + "b\n" + fmtprice(prev_mid) + " " + fc_dir_str,
+         style    = label.style_label_left,
+         color    = color.new(color.black, 40),
+         textcolor= fc_col_mid,
+         size     = size.small)
+
 // ─── FEATURES (D=4) ──────────────────────────────────────────────────────────
 price_for_ret = use_kf_feat ? kf_price : close
 lr    = price_for_ret > 0 and price_for_ret[1] > 0 ? math.log(price_for_ret / price_for_ret[1]) : 0.0
@@ -267,57 +404,46 @@ var array<float> HSG_INIT = array.new_float(25, 1.0)
 var array<float> HA_INIT  = array.new_float(25, 0.0)
 
 if barstate.isfirst
-    // mu — SIDE (state 0)
     array.set(HMU_INIT,  0,  0.0)
     array.set(HMU_INIT,  1, -0.3)
     array.set(HMU_INIT,  2,  0.0)
     array.set(HMU_INIT,  3, -0.3)
-    // mu — BULL (state 1)
     array.set(HMU_INIT,  5,  0.6)
     array.set(HMU_INIT,  6,  0.4)
     array.set(HMU_INIT,  7,  0.5)
     array.set(HMU_INIT,  8,  0.5)
-    // mu — BEAR (state 2)
     array.set(HMU_INIT, 10, -0.6)
     array.set(HMU_INIT, 11,  0.4)
     array.set(HMU_INIT, 12, -0.5)
     array.set(HMU_INIT, 13,  0.5)
-    // mu — VBULL (state 3)
     array.set(HMU_INIT, 15,  1.0)
     array.set(HMU_INIT, 16,  1.2)
     array.set(HMU_INIT, 17,  0.8)
     array.set(HMU_INIT, 18,  1.2)
-    // mu — VBEAR (state 4)
     array.set(HMU_INIT, 20, -1.0)
     array.set(HMU_INIT, 21,  1.2)
     array.set(HMU_INIT, 22, -0.8)
     array.set(HMU_INIT, 23,  1.2)
-    // sigma — SIDE
     array.set(HSG_INIT,  0, 0.8)
     array.set(HSG_INIT,  1, 0.9)
     array.set(HSG_INIT,  2, 0.8)
     array.set(HSG_INIT,  3, 0.8)
-    // sigma — BULL
     array.set(HSG_INIT,  5, 1.2)
     array.set(HSG_INIT,  6, 1.2)
     array.set(HSG_INIT,  7, 1.2)
     array.set(HSG_INIT,  8, 1.0)
-    // sigma — BEAR
     array.set(HSG_INIT, 10, 1.2)
     array.set(HSG_INIT, 11, 1.2)
     array.set(HSG_INIT, 12, 1.2)
     array.set(HSG_INIT, 13, 1.0)
-    // sigma — VBULL
     array.set(HSG_INIT, 15, 1.5)
     array.set(HSG_INIT, 16, 1.5)
     array.set(HSG_INIT, 17, 1.5)
     array.set(HSG_INIT, 18, 1.3)
-    // sigma — VBEAR
     array.set(HSG_INIT, 20, 1.5)
     array.set(HSG_INIT, 21, 1.5)
     array.set(HSG_INIT, 22, 1.5)
     array.set(HSG_INIT, 23, 1.3)
-    // transition — diagonal dominan
     for i_a = 0 to N_MAX - 1
         for j_a = 0 to N_MAX - 1
             array.set(HA_INIT, i_a*N_MAX+j_a, i_a == j_a ? 0.65 : 0.35 / 4.0)
@@ -364,6 +490,179 @@ var array<float> VP = array.from(0.35, 0.25, 0.25, 0.10, 0.05)
 var int   VDUR     = 0
 var int   VDUR_RAW = 0
 
+// ─── [NEW v9] POSTERIOR HISTORY FOR RSF ──────────────────────────────────────
+// Store rolling window of posterior probs for each state (up to N_MAX=5)
+// We keep rsf_win+rsf_smooth+rsf_accel_win bars of history
+var int RSF_BUFLEN = 25   // max needed: rsf_win + smoothing overhead
+var array<float> VP_HIST_0 = array.new_float(0)  // state 0 history
+var array<float> VP_HIST_1 = array.new_float(0)  // state 1 history
+var array<float> VP_HIST_2 = array.new_float(0)  // state 2 history
+var array<float> VP_HIST_3 = array.new_float(0)  // state 3 history
+var array<float> VP_HIST_4 = array.new_float(0)  // state 4 history
+
+// Push current VP to history buffers
+array.push(VP_HIST_0, array.get(VP, 0))
+array.push(VP_HIST_1, array.get(VP, 1))
+array.push(VP_HIST_2, array.get(VP, 2))
+array.push(VP_HIST_3, array.get(VP, 3))
+array.push(VP_HIST_4, array.get(VP, 4))
+if array.size(VP_HIST_0) > RSF_BUFLEN
+    array.shift(VP_HIST_0)
+    array.shift(VP_HIST_1)
+    array.shift(VP_HIST_2)
+    array.shift(VP_HIST_3)
+    array.shift(VP_HIST_4)
+
+// ─── [NEW v9] RSF COMPUTATION ────────────────────────────────────────────────
+// RSF = first derivative (velocity) + second derivative (acceleration) of
+//       the smoothed posterior P(current_state | obs) over rsf_win bars.
+// Steps:
+//   1. Smooth P series with EMA (rsf_smooth length) to reduce noise.
+//   2. Velocity  = slope of smoothed P over rsf_win (linear regression slope).
+//   3. Acceleration = change in velocity over rsf_accel_win.
+// Interpretation:
+//   vel > 0  → regime strengthening (probability rising)
+//   vel < 0  → regime weakening     (probability falling)
+//   acc > 0  → velocity accelerating (momentum building)
+//   acc < 0  → velocity decelerating (momentum fading)
+
+// Helper: compute EMA of array (in-place approximation, last value)
+ema_of_arr(arr, ema_l) =>
+    n   = array.size(arr)
+    k   = 2.0 / (float(ema_l) + 1.0)
+    val = array.get(arr, 0)
+    for ii = 1 to n - 1
+        val := val * (1.0 - k) + array.get(arr, ii) * k
+    val
+
+// Helper: linear regression slope of an array
+linreg_slope_arr(arr, win) =>
+    n   = array.size(arr)
+    use = math.min(win, n)
+    if use < 2
+        0.0
+    else
+        sx  = 0.0
+        sy  = 0.0
+        sxy = 0.0
+        sxx = 0.0
+        for ii = 0 to use - 1
+            xi  = float(ii)
+            yi  = array.get(arr, n - use + ii)
+            sx  += xi
+            sy  += yi
+            sxy += xi * yi
+            sxx += xi * xi
+        denom = float(use) * sxx - sx * sx
+        denom != 0.0 ? (float(use) * sxy - sx * sy) / denom : 0.0
+
+// Per-state velocity and acceleration arrays  (computed each bar via history)
+rsf_vp_arr(state_hist) =>
+    n = array.size(state_hist)
+    if n < 2
+        [0.0, 0.0, 0.0]
+    else
+        // Build smoothed-P sub-array (last RSF_BUFLEN values)
+        use_n = math.min(n, RSF_BUFLEN)
+        sub   = array.new_float(use_n)
+        for ii = 0 to use_n - 1
+            array.set(sub, ii, array.get(state_hist, n - use_n + ii))
+        // EMA smooth
+        k_ema  = 2.0 / (math.max(float(rsf_smooth), 1.0) + 1.0)
+        ema_v  = array.get(sub, 0)
+        smth   = array.new_float(use_n)
+        array.set(smth, 0, ema_v)
+        for ii = 1 to use_n - 1
+            ema_v := ema_v * (1.0 - k_ema) + array.get(sub, ii) * k_ema
+            array.set(smth, ii, ema_v)
+        // Current smoothed value
+        cur_sm = array.get(smth, use_n - 1)
+        // Velocity: linreg slope over rsf_win
+        vel = linreg_slope_arr(smth, rsf_win)
+        // Acceleration: velocity series approximated as difference
+        vel_prev = use_n >= rsf_win + rsf_accel_win ?
+             linreg_slope_arr(smth, rsf_win) : vel
+        // Build two velocity estimates: current vs rsf_accel_win bars ago
+        if use_n >= rsf_win + rsf_accel_win
+            sub_old = array.new_float(use_n - rsf_accel_win)
+            for ii = 0 to use_n - rsf_accel_win - 1
+                array.set(sub_old, ii, array.get(smth, ii))
+            vel_prev := linreg_slope_arr(sub_old, rsf_win)
+        acc = vel - vel_prev
+        [cur_sm, vel, acc]
+
+[rsf_sm0, rsf_vel0, rsf_acc0] = rsf_vp_arr(VP_HIST_0)
+[rsf_sm1, rsf_vel1, rsf_acc1] = rsf_vp_arr(VP_HIST_1)
+[rsf_sm2, rsf_vel2, rsf_acc2] = rsf_vp_arr(VP_HIST_2)
+[rsf_sm3, rsf_vel3, rsf_acc3] = rsf_vp_arr(VP_HIST_3)
+[rsf_sm4, rsf_vel4, rsf_acc4] = rsf_vp_arr(VP_HIST_4)
+
+// Active state RSF (current regime VR)
+rsf_vel_active = VR == 0 ? rsf_vel0 : VR == 1 ? rsf_vel1 : VR == 2 ? rsf_vel2 : VR == 3 ? rsf_vel3 : rsf_vel4
+rsf_acc_active = VR == 0 ? rsf_acc0 : VR == 1 ? rsf_acc1 : VR == 2 ? rsf_acc2 : VR == 3 ? rsf_acc3 : rsf_acc4
+rsf_sm_active  = VR == 0 ? rsf_sm0  : VR == 1 ? rsf_sm1  : VR == 2 ? rsf_sm2  : VR == 3 ? rsf_sm3  : rsf_sm4
+
+// RSF signal classification
+rsf_signal =
+     rsf_vel_active >  0.005 and rsf_acc_active >= 0 ? "STRENGTHENING ▲▲" :
+     rsf_vel_active >  0.005 and rsf_acc_active <  0 ? "RISING (fading) ▲" :
+     rsf_vel_active < -0.005 and rsf_acc_active <= 0 ? "WEAKENING ▼▼" :
+     rsf_vel_active < -0.005 and rsf_acc_active >  0 ? "FALLING (slowing) ▼" :
+     "STABLE →"
+
+rsf_col =
+     rsf_vel_active >  0.005 and rsf_acc_active >= 0 ? CB :
+     rsf_vel_active >  0.005 and rsf_acc_active <  0 ? color.rgb(200,230,100) :
+     rsf_vel_active < -0.005 and rsf_acc_active <= 0 ? CR :
+     rsf_vel_active < -0.005 and rsf_acc_active >  0 ? color.rgb(230,160,80)  : CDT
+
+// ─── [NEW v9] MARGIN CONFIDENCE ──────────────────────────────────────────────
+// Entropy (VCH) is computed globally over all states → can mask local
+// discriminability when two states are close but others are far.
+// Margin = P(best) - P(second_best) measures how decisively the MAP state
+// beats its nearest competitor.  A high margin means the model is certain
+// WHICH state, even if entropy is moderate.
+
+calc_margin_conf(vp_arr, N) =>
+    p1 = -1.0
+    p2 = -1.0
+    for s = 0 to N - 1
+        pv = array.get(vp_arr, s)
+        if pv > p1
+            p2 := p1
+            p1 := pv
+        else if pv > p2
+            p2 := pv
+    math.max(p1 - p2, 0.0)
+
+var float VCM       = 0.0   // raw margin confidence
+var float VCM_SMOOTH= 0.0   // EMA-smoothed margin confidence
+var string VCM_TIER = "MODERATE"
+
+VCM := calc_margin_conf(VP, n_states)
+
+// EMA smooth margin over mc_smooth bars
+k_mc      = 2.0 / (float(mc_smooth) + 1.0)
+VCM_SMOOTH := VCM_SMOOTH * (1.0 - k_mc) + VCM * k_mc
+
+VCM_TIER := VCM_SMOOTH >= mc_strong_thr ? "STRONG" :
+             VCM_SMOOTH <  mc_weak_thr   ? "WEAK"   : "MODERATE"
+
+// Combined tier: use STRICTER of entropy-tier and margin-tier
+// (an entry is only HIGH if BOTH metrics agree it is clear)
+var string VCH_TIER           = "MODERATE"
+var string COMBINED_TIER      = "MODERATE"
+var int    combined_tier_score = 0
+var color  combined_col        = color.rgb(255,200,0)
+var color  mc_col              = color.rgb(255,200,0)
+
+combined_tier_score := (VCH_TIER == "STRONG" ? 2 : VCH_TIER == "WEAK" ? 0 : 1) +
+                       (VCM_TIER == "STRONG" ? 2 : VCM_TIER == "WEAK" ? 0 : 1)
+COMBINED_TIER := combined_tier_score >= 4 ? "STRONG" :
+                 combined_tier_score <= 1 ? "WEAK"   : "MODERATE"
+combined_col  := COMBINED_TIER == "STRONG" ? CB : COMBINED_TIER == "WEAK" ? CR : color.rgb(255,200,0)
+mc_col        := VCM_SMOOTH >= mc_strong_thr ? CB : VCM_SMOOTH < mc_weak_thr ? CR : color.rgb(255, 200, 0)
+
 // ─── ADAPTIVE SL/TP STATE ────────────────────────────────────────────────────
 var float  SL_MULT_FINAL = 0.0
 var float  RR_FINAL      = 0.0
@@ -375,7 +674,6 @@ var float  TP_PRICE_L    = 0.0
 var float  TP_PRICE_S    = 0.0
 var float  PT_PRICE_L    = 0.0
 var float  PT_PRICE_S    = 0.0
-var string VCH_TIER      = "MODERATE"
 var float  SL_ADJ_FACTOR = 1.0
 var float  RR_ADJ        = 2.0
 
@@ -481,7 +779,6 @@ if barstate.islast and should_retrain
 
     if T >= 10
         for _it = 0 to bw_n - 1
-            // Forward
             al  = array.new_float(T * N, 0.0)
             sc  = array.new_float(T, 1e-300)
             s0v = 0.0
@@ -507,7 +804,6 @@ if barstate.islast and should_retrain
                 for s = 0 to N - 1
                     array.set(al, t*N+s, array.get(al, t*N+s) / stv)
 
-            // Backward
             be = array.new_float(T * N, 0.0)
             for s = 0 to N - 1
                 array.set(be, (T-1)*N+s, 1.0 / array.get(sc, T-1))
@@ -521,7 +817,6 @@ if barstate.islast and should_retrain
                         sm += array.get(HA, s*N+sn) * bsn * array.get(be, (t+1)*N+sn)
                     array.set(be, t*N+s, sm / sct)
 
-            // Gamma
             gm = array.new_float(T * N, 0.0)
             for t = 0 to T - 1
                 gs = 0.0
@@ -533,7 +828,6 @@ if barstate.islast and should_retrain
                 for s = 0 to N - 1
                     array.set(gm, t*N+s, array.get(gm, t*N+s) / gs)
 
-            // Xi
             xi = array.new_float((T-1)*N*N, 0.0)
             for t = 0 to T - 2
                 xs = 0.0
@@ -548,7 +842,6 @@ if barstate.islast and should_retrain
                     for j = 0 to N - 1
                         array.set(xi, t*N*N+i*N+j, array.get(xi, t*N*N+i*N+j) / xs)
 
-            // Update Pi
             psum = 0.0
             for s = 0 to N - 1
                 psum += array.get(gm, s)
@@ -556,7 +849,6 @@ if barstate.islast and should_retrain
             for s = 0 to N - 1
                 array.set(HP, s, array.get(gm, s) / psum)
 
-            // Update A
             for i = 0 to N - 1
                 di = 0.0
                 for t = 0 to T - 2
@@ -573,7 +865,6 @@ if barstate.islast and should_retrain
                     for j = 0 to N - 1
                         array.set(HA, i*N+j, array.get(HA, i*N+j) / rs)
 
-            // Update Mu & Sigma
             for s = 0 to N - 1
                 gs2 = 0.0
                 for t = 0 to T - 1
@@ -810,11 +1101,12 @@ if barstate.islast
 // ─── ADAPTIVE SL/TP ──────────────────────────────────────────────────────────
 atr_sl = ta.atr(atr_len_sl)
 
-is_strong   = VCH >= vch_strong
-is_weak     = VCH <  vch_weak
+// [v9] SL/TP tier now uses COMBINED_TIER (margin + entropy both considered)
+is_strong   = COMBINED_TIER == "STRONG"
+is_weak     = COMBINED_TIER == "WEAK"
 is_moderate = not is_strong and not is_weak
 
-VCH_TIER      := is_strong ? "STRONG" : is_weak ? "WEAK" : "MODERATE"
+VCH_TIER      := COMBINED_TIER
 SL_ADJ_FACTOR := is_strong ? sl_tight_pct : is_weak ? sl_wide_pct : 1.0
 RR_ADJ        := is_strong ? rr_strong    : is_weak ? rr_weak      : rr_moderate
 
@@ -889,11 +1181,12 @@ if barstate.isconfirmed and not na(IR) and held and IR != LR
     LR := IR
 
 // ─── TABLE DECLARATIONS ──────────────────────────────────────────────────────
-var table TBAN = table.new(gpos(ban_ps), 1, 8,  bgcolor=color.new(color.black,30), border_width=0)
+var table TBAN = table.new(gpos(ban_ps), 1, 12, bgcolor=color.new(color.black,30), border_width=0)
 var table TMAT = table.new(gpos(mat_ps), 7, 9,  bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
 var table TSTT = table.new(gpos(stt_ps), 6, 5,  bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
-var table TSLT = table.new(gpos(slt_ps), 2, 11, bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
+var table TSLT = table.new(gpos(slt_ps), 2, 13, bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
 var table TEMT = table.new(gpos(emt_ps), 9, 9,  bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
+var table TRSF = table.new(position.middle_left, 2, 9,  bgcolor=CK, border_width=2, border_color=CK, frame_color=CF, frame_width=1)
 
 // ─── TABLE POPULATION ────────────────────────────────────────────────────────
 if barstate.islast
@@ -910,6 +1203,7 @@ if barstate.islast
 
     conf_str   = fmtp(VC)
     conf_h_str = fmtp(VCH)
+    conf_m_str = fmtp(VCM_SMOOTH)
     zr_str     = fmtf(z_ret)
     za_str     = fmtf(z_atr)
     zs_str     = fmtf(z_slope)
@@ -934,50 +1228,113 @@ if barstate.islast
 
     // ── BANNER ─────────────────────────────────────────────────────────────
     if show_ban
-        table.cell(TBAN, 0, 0, "HMM Regime: " + rgi(VR), text_color=CWT, bgcolor=color.new(rgc(VR),30), text_size=gsz("large"), text_halign=text.align_center)
-        table.cell(TBAN, 0, 1, rgd(VR), text_color=VR == 0 ? color.rgb(255,200,0) : CWT, bgcolor=color.new(color.black,50), text_size=sh, text_halign=text.align_center)
-        table.cell(TBAN, 0, 2, "Conf(y): " + conf_str + "  |  Conf(H): " + conf_h_str + "  |  Tier: " + VCH_TIER + "  |  T=" + str.tostring(temp_scale,"#.#"), text_color=tier_col, bgcolor=color.new(color.black,60), text_size=sh, text_halign=text.align_center)
-        table.cell(TBAN, 0, 3, "Dur: " + dur_str + lock_warn + "  |  Z ret=" + zr_str + " atr=" + za_str + " slope=" + zs_str + " vol=" + zv_str, text_color=dur_col, bgcolor=color.new(color.black,65), text_size=sh, text_halign=text.align_center)
-        table.cell(TBAN, 0, 4, "ATR=" + fmtf(atr_sl) + "  |  win=" + str.tostring(hmm_win) + "b  |  BW=" + str.tostring(bw_n) + "it  |  D=4  |  N=" + str.tostring(N) + "  |  KF=" + (use_kf_feat ? "ON" : "OFF"), text_color=CFT, bgcolor=color.new(color.black,70), text_size=sh, text_halign=text.align_center)
-        table.cell(TBAN, 0, 5, "KF: price=" + kfp_str + "  vel=" + kfv_str + "  resid=" + kfr_str + "  band=±" + kfb_str + "  Q=" + fmtf(kf_q_adapt) + "  R=" + fmtf(kf_r), text_color=CKF, bgcolor=color.new(color.black,72), text_size=sh, text_halign=text.align_center)
+        table.cell(TBAN, 0,  0, "HMM Regime: " + rgi(VR),
+             text_color=CWT, bgcolor=color.new(rgc(VR),30), text_size=gsz("large"), text_halign=text.align_center)
+        table.cell(TBAN, 0,  1, rgd(VR),
+             text_color=VR == 0 ? color.rgb(255,200,0) : CWT, bgcolor=color.new(color.black,50), text_size=sh, text_halign=text.align_center)
+        // [v9] Combined confidence row: entropy + margin + combined tier
+        table.cell(TBAN, 0,  2,
+             "Conf(H/entropy): " + conf_h_str + "  |  Conf(M/margin): " + conf_m_str + "  |  COMBINED: " + COMBINED_TIER,
+             text_color=combined_col, bgcolor=color.new(color.black,55), text_size=sh, text_halign=text.align_center)
+        table.cell(TBAN, 0,  3,
+             "Conf(y/posterior): " + conf_str + "  |  Tier(H): " + VCH_TIER + "  |  Tier(M): " + VCM_TIER + "  |  T=" + str.tostring(temp_scale,"#.#"),
+             text_color=tier_col, bgcolor=color.new(color.black,60), text_size=sh, text_halign=text.align_center)
+        // [v9] RSF row
+        rsf_vel_str = fmtsgn(rsf_vel_active * 1000.0)
+        rsf_acc_str = fmtsgn(rsf_acc_active * 1000.0)
+        table.cell(TBAN, 0,  4,
+             "RSF: " + rsf_signal + "  |  vel=" + rsf_vel_str + "e-3  acc=" + rsf_acc_str + "e-3  P(cur)=" + fmtp(rsf_sm_active),
+             text_color=rsf_col, bgcolor=color.new(color.black,62), text_size=sh, text_halign=text.align_center)
+        table.cell(TBAN, 0,  5,
+             "Dur: " + dur_str + lock_warn + "  |  Z ret=" + zr_str + " atr=" + za_str + " slope=" + zs_str + " vol=" + zv_str,
+             text_color=dur_col, bgcolor=color.new(color.black,65), text_size=sh, text_halign=text.align_center)
+        table.cell(TBAN, 0,  6,
+             "ATR=" + fmtf(atr_sl) + "  |  win=" + str.tostring(hmm_win) + "b  |  BW=" + str.tostring(bw_n) + "it  |  D=4  |  N=" + str.tostring(N) + "  |  KF=" + (use_kf_feat ? "ON" : "OFF"),
+             text_color=CFT, bgcolor=color.new(color.black,70), text_size=sh, text_halign=text.align_center)
+        table.cell(TBAN, 0,  7,
+             "KF: price=" + kfp_str + "  vel=" + kfv_str + "  resid=" + kfr_str + "  band=±" + kfb_str + "  Q=" + fmtf(kf_q_adapt) + "  R=" + fmtf(kf_r),
+             text_color=CKF, bgcolor=color.new(color.black,72), text_size=sh, text_halign=text.align_center)
+        // [v9] KF Forecast row
+        fc_steps_str = str.tostring(kf_fcast_steps)
+        fc_dir       = kf_velocity > 0 ? "↑" : kf_velocity < 0 ? "↓" : "→"
+        table.cell(TBAN, 0,  8,
+             "KF Forecast +" + fc_steps_str + "b: " + fmtprice(kfx0 + kfx1 * kf_fcast_steps) + " " + fc_dir + "  |  vel=" + fmtf(kf_velocity) + "  cone=" + fmtf(kf_fcast_cone),
+             text_color=CKF, bgcolor=color.new(color.black,74), text_size=sh, text_halign=text.align_center)
         conf_lvl = VCH >= 0.70 ? "STRONG" : VCH >= 0.45 ? "MODERATE" : "WEAK"
-        conf_col = VCH >= 0.70 ? CB : VCH >= 0.45 ? color.rgb(255,200,0) : CR
-        table.cell(TBAN, 0, 6, "Signal Strength: " + conf_lvl + "  (target: 45-75%)", text_color=conf_col, bgcolor=color.new(color.black,75), text_size=sh, text_halign=text.align_center)
-        table.cell(TBAN, 0, 7, retrain_line + "  [" + trigger_line + "]", text_color=retrain_col, bgcolor=color.new(color.black, DID_RETRAIN_NOW ? 40 : 80), text_size=sh, text_halign=text.align_center)
+        conf_col_b = VCH >= 0.70 ? CB : VCH >= 0.45 ? color.rgb(255,200,0) : CR
+        table.cell(TBAN, 0,  9,
+             "Signal Strength: " + conf_lvl + "  (target: 45-75%)",
+             text_color=conf_col_b, bgcolor=color.new(color.black,75), text_size=sh, text_halign=text.align_center)
+        table.cell(TBAN, 0, 10, retrain_line + "  [" + trigger_line + "]",
+             text_color=retrain_col, bgcolor=color.new(color.black, DID_RETRAIN_NOW ? 40 : 80), text_size=sh, text_halign=text.align_center)
+
+    // ── [NEW v9] RSF TABLE ─────────────────────────────────────────────────
+    if show_rsf
+        table.cell(TRSF, 0, 0, "REGIME STRENGTH FORECAST", text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TRSF, 1, 0, "vel / acc (×10⁻³)",        text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        for s_r = 0 to N - 1
+            isCurR  = s_r == VR
+            rowBgR  = isCurR ? color.new(CA, 78) : CK
+            vel_r   = s_r == 0 ? rsf_vel0 : s_r == 1 ? rsf_vel1 : s_r == 2 ? rsf_vel2 : s_r == 3 ? rsf_vel3 : rsf_vel4
+            acc_r   = s_r == 0 ? rsf_acc0 : s_r == 1 ? rsf_acc1 : s_r == 2 ? rsf_acc2 : s_r == 3 ? rsf_acc3 : rsf_acc4
+            sm_r    = s_r == 0 ? rsf_sm0  : s_r == 1 ? rsf_sm1  : s_r == 2 ? rsf_sm2  : s_r == 3 ? rsf_sm3  : rsf_sm4
+            sig_r   = vel_r >  0.005 and acc_r >= 0 ? "▲▲" :
+                      vel_r >  0.005 and acc_r <  0 ? "▲~" :
+                      vel_r < -0.005 and acc_r <= 0 ? "▼▼" :
+                      vel_r < -0.005 and acc_r >  0 ? "▼~" : "→"
+            vel_col = vel_r > 0.002 ? CB : vel_r < -0.002 ? CR : CDT
+            table.cell(TRSF, 0, s_r+1, rgn(s_r) + " " + sig_r + (isCurR ? " ◄" : ""),
+                 text_color=isCurR ? CWT : rgc(s_r), bgcolor=rowBgR, text_size=sh)
+            table.cell(TRSF, 1, s_r+1,
+                 fmtsgn(vel_r * 1000.0) + " / " + fmtsgn(acc_r * 1000.0) + "  P=" + fmtp(sm_r),
+                 text_color=vel_col, bgcolor=rowBgR, text_size=sh, text_halign=text.align_right)
+        table.cell(TRSF, 0, N+1, "Active: " + rsf_signal,
+             text_color=rsf_col, bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TRSF, 1, N+1, "win=" + str.tostring(rsf_win) + " sm=" + str.tostring(rsf_smooth),
+             text_color=CFT,     bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TRSF, 0, N+2, "Conf(M/margin):  " + conf_m_str,
+             text_color=mc_col,  bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TRSF, 1, N+2, "Tier: " + VCM_TIER,
+             text_color=mc_col,  bgcolor=CK, text_size=sh, text_halign=text.align_right)
 
     // ── ADAPTIVE SL/TP TABLE ───────────────────────────────────────────────
     if show_sltp_table
-        table.cell(TSLT, 0, 0, "ADAPTIVE SL/TP", text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_left)
-        table.cell(TSLT, 1, 0, "Basis VCH + KF",  text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
-        table.cell(TSLT, 0, 1, "Regime", text_color=CHD, bgcolor=CK, text_size=sh)
-        table.cell(TSLT, 1, 1, rgi(VR) + " | " + VCH_TIER, text_color=tier_col, bgcolor=CK, text_size=sh, text_halign=text.align_right)
-        table.cell(TSLT, 0, 2, "VCH / thr", text_color=CHD, bgcolor=CK, text_size=sh)
-        table.cell(TSLT, 1, 2, conf_h_str + "  [S:" + fmtp(vch_strong) + " W:" + fmtp(vch_weak) + "]", text_color=tier_col, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TSLT, 0,  0, "ADAPTIVE SL/TP",   text_color=CA,  bgcolor=CK, text_size=sh, text_halign=text.align_left)
+        table.cell(TSLT, 1,  0, "Margin+Entropy KF", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TSLT, 0,  1, "Regime",            text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1,  1, rgi(VR) + " | " + COMBINED_TIER, text_color=combined_col, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TSLT, 0,  2, "Entropy (H)",       text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1,  2, conf_h_str + "  tier: " + VCH_TIER, text_color=tier_col, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TSLT, 0,  3, "Margin (M)",        text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1,  3, conf_m_str + "  tier: " + VCM_TIER + "  [S≥" + fmtp(mc_strong_thr) + " W<" + fmtp(mc_weak_thr) + "]",
+             text_color=mc_col, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TSLT, 0,  4, "Combined Tier",     text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1,  4, COMBINED_TIER,       text_color=combined_col, bgcolor=CK, text_size=sv, text_halign=text.align_right)
         sl_mult_str = na(SL_MULT_FINAL) ? "N/A" : "ATR x " + fmtf(SL_MULT_FINAL) + "  (base x " + fmtf(SL_ADJ_FACTOR) + ")"
-        table.cell(TSLT, 0, 3, "SL Mult", text_color=CHD, bgcolor=CK, text_size=sh)
-        table.cell(TSLT, 1, 3, sl_mult_str, text_color=CSL, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TSLT, 0,  5, "SL Mult",           text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1,  5, sl_mult_str,          text_color=CSL, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         rr_str = na(SL_MULT_FINAL) ? "N/A" : "1 : " + fmtf(RR_FINAL)
-        table.cell(TSLT, 0, 4, "Risk : Reward", text_color=CHD, bgcolor=CK, text_size=sh)
-        table.cell(TSLT, 1, 4, rr_str, text_color=CTP, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TSLT, 0,  6, "Risk : Reward",     text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1,  6, rr_str,               text_color=CTP, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         sl_pts_str   = na(SL_PTS) ? "N/A" : fmtf(SL_PTS) + " pts"
         sl_price_str = na(SL_PTS) ? "N/A" : (is_long_regime ? fmtprice(SL_PRICE_L) : is_short_regime ? fmtprice(SL_PRICE_S) : "N/A")
-        table.cell(TSLT, 0, 5, "SL (pts / harga)", text_color=CHD, bgcolor=CK, text_size=sh)
-        table.cell(TSLT, 1, 5, sl_pts_str + " / " + sl_price_str, text_color=CSL, bgcolor=CK, text_size=sv, text_halign=text.align_right)
+        table.cell(TSLT, 0,  7, "SL (pts / harga)",  text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1,  7, sl_pts_str + " / " + sl_price_str, text_color=CSL, bgcolor=CK, text_size=sv, text_halign=text.align_right)
         tp_pts_str   = na(TP_PTS) ? "N/A" : fmtf(TP_PTS) + " pts"
         tp_price_str = na(TP_PTS) ? "N/A" : (is_long_regime ? fmtprice(TP_PRICE_L) : is_short_regime ? fmtprice(TP_PRICE_S) : "N/A")
-        table.cell(TSLT, 0, 6, "TP (pts / harga)", text_color=CHD, bgcolor=CK, text_size=sh)
-        table.cell(TSLT, 1, 6, tp_pts_str + " / " + tp_price_str, text_color=CTP, bgcolor=CK, text_size=sv, text_halign=text.align_right)
+        table.cell(TSLT, 0,  8, "TP (pts / harga)",  text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1,  8, tp_pts_str + " / " + tp_price_str, text_color=CTP, bgcolor=CK, text_size=sv, text_halign=text.align_right)
         pt_price_str = na(SL_PTS) ? "N/A" : (is_long_regime ? fmtprice(PT_PRICE_L) : is_short_regime ? fmtprice(PT_PRICE_S) : "N/A")
-        table.cell(TSLT, 0, 7, "Partial TP (1:1)", text_color=CHD, bgcolor=CK, text_size=sh)
-        table.cell(TSLT, 1, 7, na(SL_PTS) ? "N/A" : fmtf(SL_PTS) + " pts / " + pt_price_str, text_color=color.new(CTP,35), bgcolor=CK, text_size=sh, text_halign=text.align_right)
-        table.cell(TSLT, 0, 8, "Ref Price (KF/close)", text_color=CHD, bgcolor=CK, text_size=sh)
-        table.cell(TSLT, 1, 8, fmtprice(ref_price) + (kf_sl_base ? " [KF]" : " [close]"), text_color=CKF, bgcolor=CK, text_size=sh, text_halign=text.align_right)
-        table.cell(TSLT, 0, 9, "Close (raw)", text_color=CHD, bgcolor=CK, text_size=sh)
-        table.cell(TSLT, 1, 9, fmtprice(close), text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
-        status_str = VR == 0 ? "DON'T TRADE" : VCH_TIER == "WEAK" ? "SKIP / WAIT" : VCH_TIER == "STRONG" ? "HIGH PRIORITY" : "TRADE WITH CARE"
-        status_col = VR == 0 ? color.rgb(255,200,0) : VCH_TIER == "WEAK" ? CR : VCH_TIER == "STRONG" ? CB : CDT
-        table.cell(TSLT, 0, 10, "STATUS", text_color=CFT, bgcolor=CK, text_size=sh)
-        table.cell(TSLT, 1, 10, status_str, text_color=status_col, bgcolor=CK, text_size=sv, text_halign=text.align_right)
+        table.cell(TSLT, 0,  9, "Partial TP (1:1)", text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1,  9, na(SL_PTS) ? "N/A" : fmtf(SL_PTS) + " pts / " + pt_price_str, text_color=color.new(CTP,35), bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TSLT, 0, 10, "Ref Price (KF/close)", text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1, 10, fmtprice(ref_price) + (kf_sl_base ? " [KF]" : " [close]"), text_color=CKF, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        table.cell(TSLT, 0, 11, "Close (raw)",      text_color=CHD, bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1, 11, fmtprice(close),    text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
+        status_str = VR == 0 ? "DON'T TRADE" : COMBINED_TIER == "WEAK" ? "SKIP / WAIT" : COMBINED_TIER == "STRONG" ? "HIGH PRIORITY" : "TRADE WITH CARE"
+        status_col = VR == 0 ? color.rgb(255,200,0) : COMBINED_TIER == "WEAK" ? CR : COMBINED_TIER == "STRONG" ? CB : CDT
+        table.cell(TSLT, 0, 12, "STATUS",            text_color=CFT,       bgcolor=CK, text_size=sh)
+        table.cell(TSLT, 1, 12, status_str,          text_color=status_col, bgcolor=CK, text_size=sv, text_halign=text.align_right)
 
     // ── TRANSITION MATRIX ──────────────────────────────────────────────────
     if show_mat
@@ -1032,13 +1389,13 @@ if barstate.islast
             table.cell(TEMT, 6, s5+1, fmtf(array.get(HSG_CACHE, s5*5+1)), text_color=isCur5 ? CWT : COF, bgcolor=rowBg5, text_size=sh, text_halign=text.align_center)
             table.cell(TEMT, 7, s5+1, fmtp(array.get(VP, s5)) + (isCur5 ? " *" : ""), text_color=isCur5 ? color.yellow : COF, bgcolor=rowBg5, text_size=sh, text_halign=text.align_center)
             table.cell(TEMT, 8, s5+1, fmtd(exp_dv) + (isCur5 ? "/" + str.tostring(VDUR_RAW) + "b" : ""), text_color=isCur5 ? CDT : COF, bgcolor=rowBg5, text_size=sh, text_halign=text.align_center)
-        table.cell(TEMT, 0, N+1, "Z current", text_color=CFT, bgcolor=CK, text_size=sh)
-        table.cell(TEMT, 1, N+1, zr_str, text_color=CWT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
-        table.cell(TEMT, 2, N+1, za_str, text_color=CWT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
-        table.cell(TEMT, 3, N+1, zs_str, text_color=CWT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
-        table.cell(TEMT, 4, N+1, zv_str, text_color=CWT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
-        table.cell(TEMT, 5, N+1, "", text_color=CFT, bgcolor=CK, text_size=sh)
-        table.cell(TEMT, 6, N+1, "", text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TEMT, 0, N+1, "Z current",  text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TEMT, 1, N+1, zr_str,        text_color=CWT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TEMT, 2, N+1, za_str,        text_color=CWT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TEMT, 3, N+1, zs_str,        text_color=CWT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TEMT, 4, N+1, zv_str,        text_color=CWT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
+        table.cell(TEMT, 5, N+1, "",             text_color=CFT, bgcolor=CK, text_size=sh)
+        table.cell(TEMT, 6, N+1, "",             text_color=CFT, bgcolor=CK, text_size=sh)
         table.cell(TEMT, 7, N+1, "BW=" + str.tostring(bw_n) + " T=" + str.tostring(temp_scale,"#.#"), text_color=CA, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         table.cell(TEMT, 8, N+1, "int=" + str.tostring(retrain_interval) + "b", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_center)
 
