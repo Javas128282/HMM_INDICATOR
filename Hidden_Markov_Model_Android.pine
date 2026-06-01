@@ -1,21 +1,12 @@
 //@version=6
 // ═══════════════════════════════════════════════════════════════════════════
-// DST HMM v9 — XAUUSD [MOBILE EDITION] — FIXED
+// DST HMM v9 — XAUUSD [MOBILE EDITION] — FIXED v2
 // ═══════════════════════════════════════════════════════════════════════════
-// FIXES applied vs original:
-//   [F1] Semua variabel lokal non-var diberi type annotation eksplisit
-//        (float/int/bool/string/color) agar Pine v6 tidak ambiguous
-//   [F2] array.from() diganti array.new_float + set manual (HP, VP, HP_CACHE)
-//        karena array.from() dengan literal float kadang gagal di v6
-//   [F3] Variabel Kalman Filter predict step (fp00/fp01/pp00/pp01 dst)
-//        diberi prefix "float" — inilah penyebab error baris 272
-//   [F4] Compound statement di satu baris (a := b; c := d) dipecah
-//        ke baris terpisah di beberapa tempat kritis
-//   [F5] Blok forecast loop: variabel lokal di dalam loop diberi type annotation
-//   [F6] rsf_vp_arr: return tuple konsisten, variabel lokal beranotasi
-//   [F7] IR dideklarasikan sebagai int (bukan var) di scope utama
-//   [F8] flip_count, vol_shock_fired, flip_fired, conf_fired, adaptive_any,
-//        should_retrain diberi type annotation eksplisit
+// FIXES v2 (on top of v1):
+//   [F9] Semua compound statement "a := b; c := d" di blok barstate.isfirst
+//        dipecah ke baris terpisah — Pine v6 tidak mendukung semicolons
+//        sebagai statement separator di luar for/while loop body
+//   [F10] array.set() chains yang ada pada baris 372+ dipecah satu per baris
 // ═══════════════════════════════════════════════════════════════════════════
 indicator("DST HMM v9 - Mobile", overlay = true, max_labels_count = 500)
 
@@ -201,7 +192,6 @@ rgs(r)  => r == 1 ? "BIAS BUY" : r == 2 ? "BIAS SELL" : r == 3 ? "BUY (HIGH VOL)
 rgsc(r) => r == 1 ? CB : r == 2 ? CR : r == 3 ? CVB : r == 4 ? CVR : CYW
 
 // ─── KALMAN FILTER ───────────────────────────────────────────────────────────
-// [F3] Semua var state KF tetap var float (persistent)
 var float kfx0  = close
 var float kfx1  = 0.0
 var float kfp00 = 10.0
@@ -209,7 +199,6 @@ var float kfp01 = 0.0
 var float kfp10 = 0.0
 var float kfp11 = 10.0
 
-// [F3] Variabel predict/update step diberi type annotation float eksplisit
 float atr_raw_kf  = ta.atr(atr_len_f)
 float atr_mu_kf   = ta.sma(atr_raw_kf, z_win)
 float atr_sd_kf   = ta.stdev(atr_raw_kf, z_win)
@@ -266,7 +255,6 @@ if barstate.islast and show_kf_fcast
     array.clear(KF_FC_SEGS_LO)
     label.delete(KF_FC_LABEL)
 
-    // [F5] Variabel lokal di blok if diberi type annotation
     float fc_atr_ref  = ta.atr(atr_len_f)
     int   fc_vel_sign = kf_velocity > 0.01 * fc_atr_ref ? 1 : kf_velocity < -0.01 * fc_atr_ref ? -1 : 0
     color fc_col_mid  = fc_vel_sign > 0 ? kf_fcast_col_up : fc_vel_sign < 0 ? kf_fcast_col_dn : kf_fcast_col_flat
@@ -369,21 +357,50 @@ var array<float> HSG_INIT = array.new_float(25, 1.0)
 var array<float> HA_INIT  = array.new_float(25, 0.0)
 
 if barstate.isfirst
-    array.set(HMU_INIT,  0,  0.0); array.set(HMU_INIT,  1, -0.3); array.set(HMU_INIT,  2,  0.0); array.set(HMU_INIT,  3, -0.3)
-    array.set(HMU_INIT,  5,  0.6); array.set(HMU_INIT,  6,  0.4); array.set(HMU_INIT,  7,  0.5); array.set(HMU_INIT,  8,  0.5)
-    array.set(HMU_INIT, 10, -0.6); array.set(HMU_INIT, 11,  0.4); array.set(HMU_INIT, 12, -0.5); array.set(HMU_INIT, 13,  0.5)
-    array.set(HMU_INIT, 15,  1.0); array.set(HMU_INIT, 16,  1.2); array.set(HMU_INIT, 17,  0.8); array.set(HMU_INIT, 18,  1.2)
-    array.set(HMU_INIT, 20, -1.0); array.set(HMU_INIT, 21,  1.2); array.set(HMU_INIT, 22, -0.8); array.set(HMU_INIT, 23,  1.2)
-    array.set(HSG_INIT,  0, 0.8); array.set(HSG_INIT,  1, 0.9); array.set(HSG_INIT,  2, 0.8); array.set(HSG_INIT,  3, 0.8)
-    array.set(HSG_INIT,  5, 1.2); array.set(HSG_INIT,  6, 1.2); array.set(HSG_INIT,  7, 1.2); array.set(HSG_INIT,  8, 1.0)
-    array.set(HSG_INIT, 10, 1.2); array.set(HSG_INIT, 11, 1.2); array.set(HSG_INIT, 12, 1.2); array.set(HSG_INIT, 13, 1.0)
-    array.set(HSG_INIT, 15, 1.5); array.set(HSG_INIT, 16, 1.5); array.set(HSG_INIT, 17, 1.5); array.set(HSG_INIT, 18, 1.3)
-    array.set(HSG_INIT, 20, 1.5); array.set(HSG_INIT, 21, 1.5); array.set(HSG_INIT, 22, 1.5); array.set(HSG_INIT, 23, 1.3)
+    array.set(HMU_INIT,  0,  0.0)
+    array.set(HMU_INIT,  1, -0.3)
+    array.set(HMU_INIT,  2,  0.0)
+    array.set(HMU_INIT,  3, -0.3)
+    array.set(HMU_INIT,  5,  0.6)
+    array.set(HMU_INIT,  6,  0.4)
+    array.set(HMU_INIT,  7,  0.5)
+    array.set(HMU_INIT,  8,  0.5)
+    array.set(HMU_INIT, 10, -0.6)
+    array.set(HMU_INIT, 11,  0.4)
+    array.set(HMU_INIT, 12, -0.5)
+    array.set(HMU_INIT, 13,  0.5)
+    array.set(HMU_INIT, 15,  1.0)
+    array.set(HMU_INIT, 16,  1.2)
+    array.set(HMU_INIT, 17,  0.8)
+    array.set(HMU_INIT, 18,  1.2)
+    array.set(HMU_INIT, 20, -1.0)
+    array.set(HMU_INIT, 21,  1.2)
+    array.set(HMU_INIT, 22, -0.8)
+    array.set(HMU_INIT, 23,  1.2)
+    array.set(HSG_INIT,  0, 0.8)
+    array.set(HSG_INIT,  1, 0.9)
+    array.set(HSG_INIT,  2, 0.8)
+    array.set(HSG_INIT,  3, 0.8)
+    array.set(HSG_INIT,  5, 1.2)
+    array.set(HSG_INIT,  6, 1.2)
+    array.set(HSG_INIT,  7, 1.2)
+    array.set(HSG_INIT,  8, 1.0)
+    array.set(HSG_INIT, 10, 1.2)
+    array.set(HSG_INIT, 11, 1.2)
+    array.set(HSG_INIT, 12, 1.2)
+    array.set(HSG_INIT, 13, 1.0)
+    array.set(HSG_INIT, 15, 1.5)
+    array.set(HSG_INIT, 16, 1.5)
+    array.set(HSG_INIT, 17, 1.5)
+    array.set(HSG_INIT, 18, 1.3)
+    array.set(HSG_INIT, 20, 1.5)
+    array.set(HSG_INIT, 21, 1.5)
+    array.set(HSG_INIT, 22, 1.5)
+    array.set(HSG_INIT, 23, 1.3)
     for i_a = 0 to N_MAX - 1
         for j_a = 0 to N_MAX - 1
             array.set(HA_INIT, i_a*N_MAX+j_a, i_a == j_a ? 0.65 : 0.35 / 4.0)
 
-// [F2] Ganti array.from() dengan array.new_float + manual set
 var array<float> HP  = array.new_float(5, 0.0)
 var array<float> HA  = array.new_float(25, 0.0)
 var array<float> HMU = array.new_float(25, 0.0)
@@ -396,11 +413,16 @@ var array<float> PRIOR_MU  = array.new_float(25, 0.0)
 var array<float> PRIOR_SG  = array.new_float(25, 1.0)
 
 if barstate.isfirst
-    // HP init values
-    array.set(HP, 0, 0.35); array.set(HP, 1, 0.25); array.set(HP, 2, 0.25)
-    array.set(HP, 3, 0.10); array.set(HP, 4, 0.05)
-    array.set(HP_CACHE, 0, 0.35); array.set(HP_CACHE, 1, 0.25); array.set(HP_CACHE, 2, 0.25)
-    array.set(HP_CACHE, 3, 0.10); array.set(HP_CACHE, 4, 0.05)
+    array.set(HP, 0, 0.35)
+    array.set(HP, 1, 0.25)
+    array.set(HP, 2, 0.25)
+    array.set(HP, 3, 0.10)
+    array.set(HP, 4, 0.05)
+    array.set(HP_CACHE, 0, 0.35)
+    array.set(HP_CACHE, 1, 0.25)
+    array.set(HP_CACHE, 2, 0.25)
+    array.set(HP_CACHE, 3, 0.10)
+    array.set(HP_CACHE, 4, 0.05)
     for idx_i = 0 to 24
         array.set(HA,        idx_i, array.get(HA_INIT,  idx_i))
         array.set(HA_CACHE,  idx_i, array.get(HA_INIT,  idx_i))
@@ -425,14 +447,16 @@ var array<int> FLIP_HISTORY = array.new_int(0)
 var int   VR  = 0
 var float VC  = 0.35
 var float VCH = 0.35
-// [F2] VP: array.new_float + init manual
 var array<float> VP = array.new_float(5, 0.0)
 var int   VDUR     = 0
 var int   VDUR_RAW = 0
 
 if barstate.isfirst
-    array.set(VP, 0, 0.35); array.set(VP, 1, 0.25); array.set(VP, 2, 0.25)
-    array.set(VP, 3, 0.10); array.set(VP, 4, 0.05)
+    array.set(VP, 0, 0.35)
+    array.set(VP, 1, 0.25)
+    array.set(VP, 2, 0.25)
+    array.set(VP, 3, 0.10)
+    array.set(VP, 4, 0.05)
 
 // ─── RSF — POSTERIOR HISTORY ─────────────────────────────────────────────────
 var int RSF_BUFLEN = 25
@@ -442,7 +466,6 @@ var array<float> VP_HIST_2 = array.new_float(0)
 var array<float> VP_HIST_3 = array.new_float(0)
 var array<float> VP_HIST_4 = array.new_float(0)
 
-// [F4] Pecah compound push ke baris terpisah
 array.push(VP_HIST_0, array.get(VP, 0))
 array.push(VP_HIST_1, array.get(VP, 1))
 array.push(VP_HIST_2, array.get(VP, 2))
@@ -456,7 +479,6 @@ if array.size(VP_HIST_0) > RSF_BUFLEN
     array.shift(VP_HIST_4)
 
 // ─── RSF COMPUTATION ─────────────────────────────────────────────────────────
-// [F6] Fungsi dengan return tuple — variabel lokal beranotasi, hasil via named vars
 linreg_slope_arr(arr, win) =>
     int   n      = array.size(arr)
     int   use    = math.min(win, n)
@@ -516,15 +538,27 @@ float rsf_vel_active = VR == 0 ? rsf_vel0 : VR == 1 ? rsf_vel1 : VR == 2 ? rsf_v
 float rsf_acc_active = VR == 0 ? rsf_acc0 : VR == 1 ? rsf_acc1 : VR == 2 ? rsf_acc2 : VR == 3 ? rsf_acc3 : rsf_acc4
 float rsf_sm_active  = VR == 0 ? rsf_sm0  : VR == 1 ? rsf_sm1  : VR == 2 ? rsf_sm2  : VR == 3 ? rsf_sm3  : rsf_sm4
 
-string rsf_signal = rsf_vel_active >  0.005 and rsf_acc_active >= 0 ? "STRENGTHENING" :
-                    rsf_vel_active >  0.005 and rsf_acc_active <  0 ? "RISING (fading)" :
-                    rsf_vel_active < -0.005 and rsf_acc_active <= 0 ? "WEAKENING" :
-                    rsf_vel_active < -0.005 and rsf_acc_active >  0 ? "FALLING (slowing)" : "STABLE"
+string rsf_signal = ""
+if rsf_vel_active > 0.005 and rsf_acc_active >= 0
+    rsf_signal := "STRENGTHENING"
+else if rsf_vel_active > 0.005 and rsf_acc_active < 0
+    rsf_signal := "RISING (fading)"
+else if rsf_vel_active < -0.005 and rsf_acc_active <= 0
+    rsf_signal := "WEAKENING"
+else if rsf_vel_active < -0.005 and rsf_acc_active > 0
+    rsf_signal := "FALLING (slowing)"
+else
+    rsf_signal := "STABLE"
 
-color rsf_col = rsf_vel_active >  0.005 and rsf_acc_active >= 0 ? CB :
-                rsf_vel_active >  0.005 and rsf_acc_active <  0 ? color.rgb(200,230,100) :
-                rsf_vel_active < -0.005 and rsf_acc_active <= 0 ? CR :
-                rsf_vel_active < -0.005 and rsf_acc_active >  0 ? color.rgb(230,160,80) : CDT
+color rsf_col = CDT
+if rsf_vel_active > 0.005 and rsf_acc_active >= 0
+    rsf_col := CB
+else if rsf_vel_active > 0.005 and rsf_acc_active < 0
+    rsf_col := color.rgb(200, 230, 100)
+else if rsf_vel_active < -0.005 and rsf_acc_active <= 0
+    rsf_col := CR
+else if rsf_vel_active < -0.005 and rsf_acc_active > 0
+    rsf_col := color.rgb(230, 160, 80)
 
 // ─── MARGIN CONFIDENCE ───────────────────────────────────────────────────────
 calc_margin_conf(vp_arr, N) =>
@@ -544,7 +578,6 @@ var float VCM_SMOOTH = 0.0
 var string VCM_TIER  = "MODERATE"
 
 VCM := calc_margin_conf(VP, n_states)
-// [F1] k_mc diberi type annotation float agar tidak ambigu
 float k_mc = 2.0 / (float(mc_smooth) + 1.0)
 VCM_SMOOTH := VCM_SMOOTH * (1.0 - k_mc) + VCM * k_mc
 VCM_TIER   := VCM_SMOOTH >= mc_strong_thr ? "STRONG" : VCM_SMOOTH < mc_weak_thr ? "WEAK" : "MODERATE"
@@ -554,7 +587,6 @@ var string COMBINED_TIER = "MODERATE"
 var color  combined_col  = CYW
 var color  mc_col        = CYW
 
-// [F1] combined_tier_score diberi type annotation int
 int combined_tier_score = (VCH_TIER == "STRONG" ? 2 : VCH_TIER == "WEAK" ? 0 : 1) +
                           (VCM_TIER == "STRONG" ? 2 : VCM_TIER == "WEAK" ? 0 : 1)
 COMBINED_TIER := combined_tier_score >= 4 ? "STRONG" : combined_tier_score <= 1 ? "WEAK" : "MODERATE"
@@ -631,7 +663,6 @@ if z_atr > vol_shock_thr
 else
     VOL_SHOCK_COUNT := 0
 
-// [F8] Semua trigger diberi type annotation bool eksplisit
 bool vol_shock_fired = VOL_SHOCK_COUNT >= vol_shock_bars
 
 array.push(FLIP_HISTORY, VR)
@@ -652,16 +683,15 @@ bool adaptive_any = vol_shock_fired or flip_fired or conf_fired
 // ─── DECIDE WHETHER TO RETRAIN ────────────────────────────────────────────────
 DID_RETRAIN_NOW    := false
 ADAPTIVE_TRIGGERED := false
+var bool should_retrain = false
 if barstate.isconfirmed
     BARS_SINCE_RETRAIN += 1
     if COOLDOWN_LEFT > 0
         COOLDOWN_LEFT -= 1
-
-// [F8] should_retrain diberi type annotation bool
-bool should_retrain = BARS_SINCE_RETRAIN >= retrain_interval
-if use_adaptive and COOLDOWN_LEFT == 0 and adaptive_any
-    should_retrain     := true
-    ADAPTIVE_TRIGGERED := true
+    should_retrain := BARS_SINCE_RETRAIN >= retrain_interval
+    if use_adaptive and COOLDOWN_LEFT == 0 and adaptive_any
+        should_retrain     := true
+        ADAPTIVE_TRIGGERED := true
 
 // ─── BAUM-WELCH TRAINING ─────────────────────────────────────────────────────
 if barstate.islast and should_retrain
@@ -994,7 +1024,7 @@ if barstate.islast
         VC  := array.get(VP, VR)
         VCH := calc_conf_entropy(VP, n_states)
 
-// ─── UPDATE VCH_TIER setelah VCH diperbarui ──────────────────────────────────
+// ─── UPDATE VCH_TIER ─────────────────────────────────────────────────────────
 VCH_TIER := VCH >= vch_strong ? "STRONG" : VCH < vch_weak ? "WEAK" : "MODERATE"
 
 // ─── ADAPTIVE SL/TP ──────────────────────────────────────────────────────────
@@ -1022,7 +1052,6 @@ TP_PRICE_S := na(TP_PTS) ? float(na) : ref_price - TP_PTS
 PT_PRICE_S := na(SL_PTS) ? float(na) : ref_price - SL_PTS
 
 // ─── INSTANTANEOUS REGIME ────────────────────────────────────────────────────
-// [F7] ir_best/ir_best_lp sebagai var, IR sebagai int biasa
 var int   ir_best    = 0
 var float ir_best_lp = -1e30
 ir_best    := 0
@@ -1114,9 +1143,6 @@ if barstate.islast
 
     int row = 0
 
-    // ══════════════════════════════════════════════════════════════
-    // SECTION 1 — SIGNAL
-    // ══════════════════════════════════════════════════════════════
     if sec_signal
         table.cell(TM, 0, row, "SIGNAL & ADAPTIVE SL/TP", text_color=CK, bgcolor=color.new(CA,20), text_size=sh, text_halign=text.align_left)
         table.cell(TM, 1, row, "XAUUSD", text_color=CK, bgcolor=color.new(CA,20), text_size=sh, text_halign=text.align_right)
@@ -1155,9 +1181,6 @@ if barstate.islast
         table.cell(TM, 1, row, status_str, text_color=status_col, bgcolor=CK, text_size=sv, text_halign=text.align_right)
         row += 1
 
-    // ══════════════════════════════════════════════════════════════
-    // SECTION 2 — KALMAN FILTER
-    // ══════════════════════════════════════════════════════════════
     if sec_kalman
         table.cell(TM, 0, row, "KALMAN FILTER", text_color=CK, bgcolor=color.new(CKF,30), text_size=sh, text_halign=text.align_left)
         table.cell(TM, 1, row, "D=4 KF-enhanced", text_color=CK, bgcolor=color.new(CKF,30), text_size=sh, text_halign=text.align_right)
@@ -1183,9 +1206,6 @@ if barstate.islast
         table.cell(TM, 1, row, "ret:" + zr_str + " atr:" + za_str + " slp:" + zs_str + " vol:" + zv_str, text_color=CWT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         row += 1
 
-    // ══════════════════════════════════════════════════════════════
-    // SECTION 3 — REGIME STRENGTH FORECAST
-    // ══════════════════════════════════════════════════════════════
     if sec_rsf
         table.cell(TM, 0, row, "REGIME STRENGTH FORECAST", text_color=CK, bgcolor=color.new(rsf_col,40), text_size=sh, text_halign=text.align_left)
         table.cell(TM, 1, row, rsf_signal, text_color=CK, bgcolor=color.new(rsf_col,40), text_size=sh, text_halign=text.align_right)
@@ -1204,9 +1224,6 @@ if barstate.islast
         table.cell(TM, 1, row, conf_m_str + " (" + VCM_TIER + ")  [S>=" + fmtp(mc_strong_thr) + " W<" + fmtp(mc_weak_thr) + "]", text_color=mc_col, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         row += 1
 
-    // ══════════════════════════════════════════════════════════════
-    // SECTION 4 — RETRAINING STATUS
-    // ══════════════════════════════════════════════════════════════
     if sec_retrain
         color retrain_hdr_bg = DID_RETRAIN_NOW ? color.new(color.rgb(255,120,50), 40) : color.new(color.rgb(50,100,200), 40)
         table.cell(TM, 0, row, "RETRAINING STATUS", text_color=CK, bgcolor=retrain_hdr_bg, text_size=sh, text_halign=text.align_left)
@@ -1225,9 +1242,6 @@ if barstate.islast
         table.cell(TM, 1, row, "vol:" + str.tostring(VOL_SHOCK_COUNT) + "/" + str.tostring(vol_shock_bars) + "  flip:" + str.tostring(flip_count) + "/" + str.tostring(flip_limit) + "  H:" + conf_h_str, text_color=adaptive_any ? color.rgb(255,120,50) : CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         row += 1
 
-    // ══════════════════════════════════════════════════════════════
-    // SECTION 5 — TRANSITION MATRIX
-    // ══════════════════════════════════════════════════════════════
     if sec_matrix
         table.cell(TM, 0, row, "TRANSITION MATRIX  N=" + str.tostring(N), text_color=CK, bgcolor=color.new(CB,30), text_size=sh, text_halign=text.align_left)
         table.cell(TM, 1, row, "Baum-Welch MAP", text_color=CK, bgcolor=color.new(CB,30), text_size=sh, text_halign=text.align_right)
@@ -1261,9 +1275,6 @@ if barstate.islast
         table.cell(TM, 1, row, ps_str, text_color=CDT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
         row += 1
 
-    // ══════════════════════════════════════════════════════════════
-    // SECTION 6 — EMISSION PARAMS
-    // ══════════════════════════════════════════════════════════════
     if sec_emit
         table.cell(TM, 0, row, "EMISSION  D=4" + (use_kf_feat ? " KF" : ""), text_color=CK, bgcolor=color.new(CS,30), text_size=sh, text_halign=text.align_left)
         table.cell(TM, 1, row, "mu_ret|atr|slope|vol|P(s)", text_color=CK, bgcolor=color.new(CS,30), text_size=sh, text_halign=text.align_right)
@@ -1275,9 +1286,6 @@ if barstate.islast
             table.cell(TM, 1, row, em_str, text_color=isCur5 ? CWT : CDT, bgcolor=isCur5 ? color.new(CA,75) : CK, text_size=sh, text_halign=text.align_center)
             row += 1
 
-    // ══════════════════════════════════════════════════════════════
-    // SECTION 7 — LONG-RUN DISTRIBUTION
-    // ══════════════════════════════════════════════════════════════
     if sec_stat
         table.cell(TM, 0, row, "LONG-RUN DISTRIBUTION", text_color=CK, bgcolor=color.new(CR,40), text_size=sh, text_halign=text.align_left)
         table.cell(TM, 1, row, "A^" + str.tostring(stat_pow), text_color=CK, bgcolor=color.new(CR,40), text_size=sh, text_halign=text.align_right)
@@ -1291,10 +1299,9 @@ if barstate.islast
         table.cell(TM, 1, row, "H:" + conf_h_str + " live", text_color=CA, bgcolor=CDG, text_size=sh, text_halign=text.align_right)
         row += 1
 
-    // ── Footer ────────────────────────────────────────────────────
     table.cell(TM, 0, row, "N=" + str.tostring(N) + " D=4 KF win=" + str.tostring(hmm_win) + "b int=" + str.tostring(retrain_interval) + "b BW=" + str.tostring(bw_n), text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_left)
     table.cell(TM, 1, row, "reg=" + str.tostring(reg_str,"#.##") + " T=" + str.tostring(temp_scale,"#.#") + " v9", text_color=CFT, bgcolor=CK, text_size=sh, text_halign=text.align_right)
 
 // ═══════════════════════════════════════════════════════════════════════════
-// End of file — DST HMM v9 Mobile Fixed
-// ═══════════════════════════════════════════════════════════════════════════
+// End of file — DST HMM v9 Mobile Fixed v2
+// ═══════════════════════════════════════════════════════════════
